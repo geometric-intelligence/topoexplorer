@@ -310,31 +310,23 @@ def incidence_to_sparse_incidence(data):
     return None
 
 
-def _sparse_coo_nnz(sp) -> int:
-    if sp is None:
-        return 0
-    sp = sp.coalesce()
-    return int(sp.values().numel())
-
-
-def incidence_rank_k_to_sparse(data, rank: int):
+def incidence_rank_one_to_sparse(data):
     """
-    Sparse (k-1)-cell to k-cell incidence from ``get_complex_connectivity`` output.
+    Sparse 0-cell to 1-cell incidence from simplicial / cell / combinatorial lifts.
 
-    Accepts torch sparse COO, ``[2, nnz]`` index tensors, or SciPy sparse matrices.
+    TopoBench stores these as ``incidence_1`` (see ``get_complex_connectivity``).
     """
-    key = f"incidence_{rank}"
-    inc = None
-    if hasattr(data, key):
-        inc = getattr(data, key)
-    if inc is None and key in data:
-        inc = data[key]
-    if inc is None:
+    inc1 = None
+    if hasattr(data, "incidence_1") and data.incidence_1 is not None:
+        inc1 = data.incidence_1
+    elif "incidence_1" in data:
+        inc1 = data["incidence_1"]
+    if inc1 is None:
         return None
-    if hasattr(inc, "layout") and inc.layout == torch.sparse_coo:
-        return inc.coalesce()
-    if torch.is_tensor(inc) and inc.dim() == 2 and inc.size(0) == 2:
-        row, col = inc[0].long(), inc[1].long()
+    if hasattr(inc1, "layout") and inc1.layout == torch.sparse_coo:
+        return inc1.coalesce()
+    if torch.is_tensor(inc1) and inc1.dim() == 2 and inc1.size(0) == 2:
+        row, col = inc1[0].long(), inc1[1].long()
         n0 = int(row.max().item()) + 1 if row.numel() else 0
         n1 = int(col.max().item()) + 1 if col.numel() else 0
         vals = torch.ones(row.size(0), dtype=torch.float32, device=row.device)
@@ -344,60 +336,6 @@ def incidence_rank_k_to_sparse(data, rank: int):
             (n0, n1),
             device=row.device,
         ).coalesce()
-    try:
-        import scipy.sparse as sps  # type: ignore
-
-        if sps.issparse(inc):
-            coo = inc.tocoo()
-            row = torch.as_tensor(coo.row, dtype=torch.long)
-            col = torch.as_tensor(coo.col, dtype=torch.long)
-            vals = torch.as_tensor(coo.data, dtype=torch.float32)
-            shape = (int(coo.shape[0]), int(coo.shape[1]))
-            return torch.sparse_coo_tensor(
-                torch.stack([row, col]), vals, size=shape, device=vals.device
-            ).coalesce()
-    except Exception:
-        pass
-    return None
-
-
-def incidence_rank_one_to_sparse(data):
-    """Sparse 0-cell to 1-cell incidence (alias for :func:`incidence_rank_k_to_sparse`)."""
-    return incidence_rank_k_to_sparse(data, 1)
-
-
-def _incidence_ranks_present(data):
-    ranks = []
-    for key in _data_keys(data):
-        m = re.match(r"^incidence_(\d+)$", key)
-        if m:
-            ranks.append(int(m.group(1)))
-    return sorted(set(ranks), reverse=True)
-
-
-def pick_primary_complex_incidence(data):
-    """
-    Choose a non-empty ``incidence_k`` for visualization.
-
-    Graph liftings share the same 1-skeleton, so ``incidence_1`` is often identical
-    across methods; higher ``k`` (faces, volumes, …) reflects the lift.
-    Prefers the largest ``k >= 2`` with nonzeros, then falls back to ``k == 1``.
-    """
-    ranks = _incidence_ranks_present(data)
-    for prefer_high in (True, False):
-        for k in ranks:
-            if prefer_high and k < 2:
-                continue
-            if not prefer_high and k != 1:
-                continue
-            sp = incidence_rank_k_to_sparse(data, k)
-            if sp is None or _sparse_coo_nnz(sp) == 0:
-                continue
-            return (
-                sp,
-                f"Rank-{k - 1} to rank-{k} incidence",
-                {"type": "bipartite", "source_rank": k - 1, "target_rank": k},
-            )
     return None
 
 
@@ -415,7 +353,7 @@ def get_primary_visualization_matrix(data, mode):
     """
     adj = edge_index_to_sparse_adj(data)
     inc = incidence_to_sparse_incidence(data)
-    complex_inc = pick_primary_complex_incidence(data)
+    inc1 = incidence_rank_one_to_sparse(data)
 
     if mode == "graph":
         if adj is None:
@@ -433,8 +371,12 @@ def get_primary_visualization_matrix(data, mode):
                 else {"type": "bipartite", "source_rank": 0, "target_rank": 1}
             )
             return inc, "Node–hyperedge incidence", ctx
-        if complex_inc is not None:
-            return complex_inc
+        if inc1 is not None:
+            return (
+                inc1,
+                "Rank-0 to Rank-1 incidence",
+                {"type": "bipartite", "source_rank": 0, "target_rank": 1},
+            )
         return None, None, None
 
     # auto: AbstractLifting merges lifted tensors into ``Data`` but keeps the
@@ -446,8 +388,12 @@ def get_primary_visualization_matrix(data, mode):
                 "Node–hyperedge incidence (lifted)",
                 {"type": "bipartite", "source_rank": 0, "target_kind": "hyperedge"},
             )
-        if complex_inc is not None:
-            return complex_inc
+        if inc1 is not None:
+            return (
+                inc1,
+                "Rank-0 to Rank-1 incidence",
+                {"type": "bipartite", "source_rank": 0, "target_rank": 1},
+            )
         if adj is not None:
             return (
                 adj,
@@ -542,10 +488,7 @@ def sparse_to_networkx(sparse_tensor, max_nodes=200, min_degree=0):
     # Filter by minimum degree
     if min_degree > 0:
         node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
-
-    if not node_degrees:
-        return None, {}
-
+    
     # Sample top nodes if too many
     if len(node_degrees) > max_nodes:
         top_nodes = sorted(node_degrees.keys(), key=lambda x: node_degrees[x], reverse=True)[:max_nodes]
@@ -569,11 +512,10 @@ def sparse_to_networkx(sparse_tensor, max_nodes=200, min_degree=0):
         tgt_nodes = set(indices[1])
         
         for node in src_nodes:
-            if node in valid_nodes:
+            if node in valid_nodes or len(valid_nodes) == 0:
                 G.add_node(f"src_{node}", bipartite=0, original_id=node)
         for node in tgt_nodes:
-            if node in valid_nodes:
-                G.add_node(f"tgt_{node}", bipartite=1, original_id=node)
+            G.add_node(f"tgt_{node}", bipartite=1, original_id=node)
         
         for i in range(n_edges):
             src, tgt = indices[0, i], indices[1, i]
@@ -834,217 +776,6 @@ def apply_lifting(data, lifting_info):
     return transformed
 
 
-BASIC_EDITABLE_KEYS = {
-    "feature_lifting",
-    "complex_dim",
-    "signed",
-    "k_value",
-    "loop",
-    "k_neighbors",
-    "num_communities",
-    "max_k_simplices",
-    "distance_threshold",
-}
-
-GRAPH_EDITOR_TARGETS = {"hypergraph", "simplicial", "cell", "combinatorial"}
-
-
-def _selected_lifting_editor_id(lifting_info):
-    """Stable ID used to scope editable config state."""
-    if lifting_info is None:
-        return None
-    return "::".join(
-        [
-            str(lifting_info.get("source", "")),
-            str(lifting_info.get("target", "")),
-            str(lifting_info.get("name", "")),
-            str(lifting_info.get("config_path", "")),
-        ]
-    )
-
-
-def _is_graph_family_lifting(lifting_info):
-    """True for graph->(hypergraph/simplicial/cell/combinatorial) liftings."""
-    if lifting_info is None:
-        return False
-    return (
-        lifting_info.get("source") == "graph"
-        and lifting_info.get("target") in GRAPH_EDITOR_TARGETS
-    )
-
-
-def validate_basic_lifting_config(config):
-    """Validate exposed editable config fields."""
-    errors = []
-
-    def _is_pos_int(v):
-        return isinstance(v, int) and not isinstance(v, bool) and v >= 1
-
-    if "complex_dim" in config and not _is_pos_int(config["complex_dim"]):
-        errors.append("`complex_dim` must be an integer >= 1.")
-    if "k_value" in config and not _is_pos_int(config["k_value"]):
-        errors.append("`k_value` must be an integer >= 1.")
-    if "k_neighbors" in config and not _is_pos_int(config["k_neighbors"]):
-        errors.append("`k_neighbors` must be an integer >= 1.")
-    if "num_communities" in config and not _is_pos_int(config["num_communities"]):
-        errors.append("`num_communities` must be an integer >= 1.")
-    if "max_k_simplices" in config and not _is_pos_int(config["max_k_simplices"]):
-        errors.append("`max_k_simplices` must be an integer >= 1.")
-    if "distance_threshold" in config:
-        try:
-            v = float(config["distance_threshold"])
-            if v <= 0:
-                errors.append("`distance_threshold` must be > 0.")
-        except Exception:
-            errors.append("`distance_threshold` must be a number > 0.")
-
-    if "signed" in config and not isinstance(config["signed"], bool):
-        errors.append("`signed` must be true/false.")
-    if "loop" in config and not isinstance(config["loop"], bool):
-        errors.append("`loop` must be true/false.")
-    if "feature_lifting" in config and config["feature_lifting"] in ("", None):
-        errors.append("`feature_lifting` cannot be empty.")
-    return errors
-
-
-def _hydra_default_from_interpolation(value):
-    """Extract fallback default from `${oc.select:...,<default>}` style strings."""
-    if not isinstance(value, str):
-        return None
-    m = re.match(r"^\$\{oc\.select:[^,]+,(.+)\}$", value.strip())
-    if not m:
-        return None
-    return m.group(1).strip()
-
-
-def _safe_start_int(value, default=1):
-    """Integer start value tolerant to Hydra interpolation strings."""
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        interp = _hydra_default_from_interpolation(value)
-        if interp is not None:
-            value = interp
-        try:
-            return int(value)
-        except Exception:
-            return default
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def _safe_start_float(value, default=1.0):
-    """Float start value tolerant to Hydra interpolation strings."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if isinstance(value, str):
-        interp = _hydra_default_from_interpolation(value)
-        if interp is not None:
-            value = interp
-        try:
-            return float(value)
-        except Exception:
-            return default
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _safe_start_bool(value, default=False):
-    """Boolean start value tolerant to Hydra interpolation strings."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        interp = _hydra_default_from_interpolation(value)
-        v = (interp if interp is not None else value).strip().lower()
-        if v in {"true", "1", "yes", "on"}:
-            return True
-        if v in {"false", "0", "no", "off"}:
-            return False
-    return default
-
-
-def render_basic_lifting_editor(selected_lifting):
-    """
-    Render basic-safe editable controls for graph-based liftings.
-
-    Returns
-    -------
-    tuple[dict | None, list[str]]
-        Effective edited config and validation errors.
-    """
-    if selected_lifting is None:
-        return None, []
-
-    editor_id = _selected_lifting_editor_id(selected_lifting)
-    if st.session_state.get("_editor_lifting_id") != editor_id:
-        st.session_state["_editor_lifting_id"] = editor_id
-        st.session_state["editable_lifting_config"] = copy.deepcopy(
-            selected_lifting.get("config", {})
-        )
-
-    if not _is_graph_family_lifting(selected_lifting):
-        st.caption(
-            "Config editing currently supports graph-based liftings only "
-            "(graph2hypergraph / simplicial / cell / combinatorial)."
-        )
-        return copy.deepcopy(selected_lifting.get("config", {})), []
-
-    cfg = st.session_state.get("editable_lifting_config", {})
-    st.markdown("**Editable config (basic)**")
-
-    feature_options = ["ProjectionSum", "Identity", "Concatenation", "Set"]
-    editable_keys = [k for k in BASIC_EDITABLE_KEYS if k in cfg]
-    for key in sorted(editable_keys):
-        wkey = f"editcfg::{editor_id}::{key}"
-        val = cfg.get(key)
-        if key == "feature_lifting":
-            opts = feature_options[:]
-            if val not in opts and val is not None:
-                opts.insert(0, val)
-            idx = opts.index(val) if val in opts else 0
-            cfg[key] = st.selectbox("feature_lifting", opts, index=idx, key=wkey)
-        elif key in {"signed", "loop"}:
-            cfg[key] = st.toggle(key, value=_safe_start_bool(val), key=wkey)
-        elif key in {"distance_threshold"}:
-            start = _safe_start_float(val, default=1.0)
-            cfg[key] = st.number_input(key, value=start, min_value=0.000001, key=wkey)
-        else:
-            start = _safe_start_int(val, default=1)
-            cfg[key] = int(st.number_input(key, value=start, min_value=1, step=1, key=wkey))
-
-    st.session_state["editable_lifting_config"] = cfg
-    errors = validate_basic_lifting_config(cfg)
-    if errors:
-        st.error("Invalid lifting config:\n- " + "\n- ".join(errors))
-
-    c_reset, _ = st.columns([1, 3])
-    with c_reset:
-        if st.button("Reset edited config to defaults", key=f"cfg_reset::{editor_id}"):
-            for k in BASIC_EDITABLE_KEYS:
-                wk = f"editcfg::{editor_id}::{k}"
-                if wk in st.session_state:
-                    del st.session_state[wk]
-            st.session_state["editable_lifting_config"] = copy.deepcopy(
-                selected_lifting.get("config", {})
-            )
-            st.rerun()
-
-    with st.expander("Config preview", expanded=False):
-        cfg_display = {
-            k: v
-            for k, v in cfg.items()
-            if k not in ("neighborhoods",)
-        }
-        st.json(cfg_display)
-    return copy.deepcopy(cfg), errors
-
-
 # ============================================================================
 # Streamlit App
 # ============================================================================
@@ -1089,66 +820,36 @@ def main():
             )
             st.caption(f"**{selected_domain}** / **{selected_dataset}**")
 
-        use_lifting = st.toggle(
-            "Use lifting",
-            value=st.session_state.get("use_lifting", False),
-            key="use_lifting",
-        )
-
-        selected_lifting = None
-        edited_lifting_config = None
-        edited_lifting_errors = []
-        if use_lifting:
-            with st.expander("Transform / lifting (optional)", expanded=True):
-                all_liftings = discover_available_liftings()
-                available_for_domain = all_liftings.get(selected_domain, [])
-                if not available_for_domain:
-                    st.caption(f"No liftings configured for domain **{selected_domain}**.")
-                    st.session_state["selected_lifting_name"] = None
-                else:
-                    targets = sorted(set(l["target"] for l in available_for_domain))
-                    previous_target = st.session_state.get("selected_lifting_target")
-                    target_index = (
-                        targets.index(previous_target)
-                        if previous_target in targets
-                        else 0
-                    )
-                    selected_target = st.selectbox(
-                        "Target domain",
-                        options=targets,
-                        index=target_index,
-                        format_func=lambda x: x.capitalize(),
-                    )
-                    st.session_state["selected_lifting_target"] = selected_target
-                    liftings_for_target = [
-                        l for l in available_for_domain if l["target"] == selected_target
-                    ]
-                    lifting_options = {l["name"]: l for l in liftings_for_target}
-                    lifting_names = list(lifting_options.keys())
-                    previous_name = st.session_state.get("selected_lifting_name")
-                    name_index = (
-                        lifting_names.index(previous_name)
-                        if previous_name in lifting_names
-                        else 0
-                    )
-                    selected_lifting_name = st.selectbox(
-                        "Lifting method",
-                        options=lifting_names,
-                        index=name_index,
-                    )
-                    st.session_state["selected_lifting_name"] = selected_lifting_name
-                    selected_lifting = lifting_options[selected_lifting_name]
-                    edited_lifting_config, edited_lifting_errors = render_basic_lifting_editor(
-                        selected_lifting
-                    )
-        else:
-            # Keep last lifting selection in session but do not apply/show it.
+        with st.expander("Transform / lifting (optional)", expanded=True):
+            all_liftings = discover_available_liftings()
+            available_for_domain = all_liftings.get(selected_domain, [])
             selected_lifting = None
-
-        # Keep active (possibly hidden) lifting state centralized.
-        st.session_state["selected_lifting"] = selected_lifting
-        st.session_state["edited_lifting_config"] = edited_lifting_config
-        st.session_state["edited_lifting_errors"] = edited_lifting_errors
+            if not available_for_domain:
+                st.caption(f"No liftings configured for domain **{selected_domain}**.")
+            else:
+                targets = sorted(set(l["target"] for l in available_for_domain))
+                selected_target = st.selectbox(
+                    "Target domain",
+                    options=targets,
+                    format_func=lambda x: x.capitalize(),
+                )
+                liftings_for_target = [
+                    l for l in available_for_domain if l["target"] == selected_target
+                ]
+                lifting_options = {l["name"]: l for l in liftings_for_target}
+                selected_lifting_name = st.selectbox(
+                    "Lifting method",
+                    options=list(lifting_options.keys()),
+                )
+                selected_lifting = lifting_options[selected_lifting_name]
+                with st.expander("Config preview", expanded=False):
+                    cfg_display = {
+                        k: v
+                        for k, v in selected_lifting["config"].items()
+                        if k not in ("neighborhoods",)
+                    }
+                    st.json(cfg_display)
+            st.session_state["selected_lifting"] = selected_lifting
 
         st.subheader("Graph sampling")
         max_nodes = st.slider(
@@ -1168,6 +869,12 @@ def main():
         st.session_state["min_degree"] = min_degree
 
         st.subheader("Actions")
+        apply_lift_load_graph = st.toggle(
+            "Apply selected lifting on load",
+            value=False,
+            disabled=st.session_state.get("selected_lifting") is None,
+            key="apply_lift_load_graph",
+        )
         if st.button("Load graph", type="primary", use_container_width=True):
             with st.spinner("Loading and opening graph…"):
                 # Stage 1: dataset load
@@ -1189,21 +896,10 @@ def main():
                 sel_lift = st.session_state.get("selected_lifting")
                 current_data = raw
                 applied_lift = None
-                if use_lifting and sel_lift is not None:
-                    cfg_errors = st.session_state.get("edited_lifting_errors") or []
-                    if cfg_errors:
-                        st.error(
-                            "Error applying lifting: invalid lifting config.\n- "
-                            + "\n- ".join(cfg_errors)
-                        )
-                        return
-                    effective_cfg = st.session_state.get("edited_lifting_config")
-                    lifting_payload = copy.deepcopy(sel_lift)
-                    if isinstance(effective_cfg, dict):
-                        lifting_payload["config"] = copy.deepcopy(effective_cfg)
+                if apply_lift_load_graph and sel_lift is not None:
                     try:
-                        current_data = [apply_lifting(raw, lifting_payload)]
-                        applied_lift = lifting_payload
+                        current_data = [apply_lifting(raw, sel_lift)]
+                        applied_lift = sel_lift
                     except Exception as e:
                         st.error(f"Error applying lifting: {e}")
                         return
@@ -1315,7 +1011,7 @@ def main():
     graph_ok = edge_index_to_sparse_adj(data) is not None
     inc_ok = (
         incidence_to_sparse_incidence(data) is not None
-        or pick_primary_complex_incidence(data) is not None
+        or incidence_rank_one_to_sparse(data) is not None
     )
     if not (graph_ok or inc_ok):
         st.warning("No graph/incidence connectivity found for visualization.")
@@ -1334,7 +1030,7 @@ def main():
     else:
         mode_options = ["incidence"]
     mode_labels = {
-        "auto": "Auto (prefer highest-rank incidence, hyperedges, else graph)",
+        "auto": "Auto (prefer lifted incidence, else graph)",
         "graph": "Graph (adjacency from pairwise edges)",
         "incidence": "Incidence",
     }

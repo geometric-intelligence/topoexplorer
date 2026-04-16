@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <h2 align="center">
   <img src="resources/logo.jpg" width="800">
 </h2>
@@ -491,3 +492,6 @@ Feel free to reach out via email if you want to collaborate, do your thesis with
 📧 **Contact Email:** [topological.intelligence@gmail.com](mailto:topological.intelligence@gmail.com)  
 ▶️ **YouTube Channel:** [Topological Intelligence](https://www.youtube.com/@TopologicalIntelligence)
 
+=======
+# tdl-visualization-app
+>>>>>>> b20d63a84dd479fef85a639882a482d6aad12025
