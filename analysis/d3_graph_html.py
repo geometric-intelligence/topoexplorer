@@ -7,9 +7,28 @@ import json
 from typing import Any
 
 
-def build_standalone_d3_html(payload: dict[str, Any]) -> str:
+def build_standalone_d3_html(
+    payload: dict[str, Any],
+    *,
+    embed: bool = False,
+    chart_min_height: int = 480,
+    cache_marker: str | None = None,
+) -> str:
     """
     Build a full HTML document (D3 from jsDelivr).
+
+    Parameters
+    ----------
+    payload : dict
+        Graph payload (see keys below).
+    embed : bool, optional
+        When True, size the chart for a fixed-height iframe (Streamlit
+        ``components.html``) instead of the full viewport. Default ``False``.
+    chart_min_height : int, optional
+        Minimum chart height in pixels when ``embed=True``. Default ``480``.
+    cache_marker : str, optional
+        If set, emitted as an HTML comment in ``<head>`` so successive embeds
+        differ (helps Streamlit / browser iframe cache busting).
 
     Payload keys
     ------------
@@ -26,23 +45,40 @@ def build_standalone_d3_html(payload: dict[str, Any]) -> str:
     embedded_json = json_text.replace("</", "\\u003c/")
     title_esc = html_module.escape(payload.get("title") or "Graph")
 
+    if embed:
+        chart_size_css = (
+            f"width: 100%; min-height: {int(chart_min_height)}px; "
+            "height: calc(100% - 72px);"
+        )
+        body_extra = "html, body { height: 100%; }"
+    else:
+        chart_size_css = "width: 100vw; min-height: 480px; height: calc(100vh - 88px);"
+        body_extra = ""
+
+    cache_comment = ""
+    if cache_marker:
+        cache_comment = (
+            f"  <!-- cache_marker: {html_module.escape(str(cache_marker), quote=True)} -->\n"
+        )
+
     # Split HTML: f-string cannot embed arbitrary JSON (``{`` / ``}`` in payload).
     _head = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
+{cache_comment}  <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{title_esc}</title>
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
   <style>
     * {{ box-sizing: border-box; }}
+    {body_extra}
     body {{ font-family: system-ui, Segoe UI, sans-serif; margin: 0; background: #f0f0f0; }}
     header {{ padding: 12px 16px; background: #fff; border-bottom: 1px solid #ccc; }}
     header h1 {{ margin: 0; font-size: 1.1rem; }}
     header p {{ margin: 4px 0 0; color: #555; font-size: 0.85rem; }}
-    #chart {{ width: 100vw; min-height: 480px; height: calc(100vh - 88px); }}
+    #chart {{ {chart_size_css} }}
     #err {{ color: #b00; padding: 16px; white-space: pre-wrap; font-family: monospace; }}
-    svg {{ display: block; background: #fafafa; }}
+    svg {{ display: block; background: #fafafa; width: 100%; height: 100%; }}
     .node circle {{ stroke-width: 2px; cursor: grab; }}
     .node text {{ font-size: 9px; pointer-events: none; fill: #111; }}
     line.link {{ stroke: #888; stroke-opacity: 0.75; }}

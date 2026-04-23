@@ -26,6 +26,7 @@ sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
+import streamlit.components.v1 as components
 import networkx as nx
 import torch
 
@@ -125,6 +126,21 @@ st.set_page_config(
     page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded"
+)
+
+# ~2× Streamlit’s default sidebar width (~256px in recent releases).
+_SIDEBAR_TARGET_WIDTH_PX = 512
+st.markdown(
+    f"""
+    <style>
+    [data-testid="stSidebar"][aria-expanded="true"] {{
+        min-width: {_SIDEBAR_TARGET_WIDTH_PX}px;
+        max-width: {_SIDEBAR_TARGET_WIDTH_PX}px;
+        width: {_SIDEBAR_TARGET_WIDTH_PX}px;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 DEFAULT_RANK_PALETTE = [
@@ -317,24 +333,14 @@ def _sparse_coo_nnz(sp) -> int:
     return int(sp.values().numel())
 
 
-def incidence_rank_k_to_sparse(data, rank: int):
-    """
-    Sparse (k-1)-cell to k-cell incidence from ``get_complex_connectivity`` output.
-
-    Accepts torch sparse COO, ``[2, nnz]`` index tensors, or SciPy sparse matrices.
-    """
-    key = f"incidence_{rank}"
-    inc = None
-    if hasattr(data, key):
-        inc = getattr(data, key)
-    if inc is None and key in data:
-        inc = data[key]
-    if inc is None:
+def _to_sparse_coo(matrix):
+    """Coerce torch sparse / dense edge-index / SciPy sparse to coalesced COO."""
+    if matrix is None:
         return None
-    if hasattr(inc, "layout") and inc.layout == torch.sparse_coo:
-        return inc.coalesce()
-    if torch.is_tensor(inc) and inc.dim() == 2 and inc.size(0) == 2:
-        row, col = inc[0].long(), inc[1].long()
+    if hasattr(matrix, "layout") and matrix.layout == torch.sparse_coo:
+        return matrix.coalesce()
+    if torch.is_tensor(matrix) and matrix.dim() == 2 and matrix.size(0) == 2:
+        row, col = matrix[0].long(), matrix[1].long()
         n0 = int(row.max().item()) + 1 if row.numel() else 0
         n1 = int(col.max().item()) + 1 if col.numel() else 0
         vals = torch.ones(row.size(0), dtype=torch.float32, device=row.device)
@@ -347,8 +353,8 @@ def incidence_rank_k_to_sparse(data, rank: int):
     try:
         import scipy.sparse as sps  # type: ignore
 
-        if sps.issparse(inc):
-            coo = inc.tocoo()
+        if sps.issparse(matrix):
+            coo = matrix.tocoo()
             row = torch.as_tensor(coo.row, dtype=torch.long)
             col = torch.as_tensor(coo.col, dtype=torch.long)
             vals = torch.as_tensor(coo.data, dtype=torch.float32)
@@ -359,6 +365,34 @@ def incidence_rank_k_to_sparse(data, rank: int):
     except Exception:
         pass
     return None
+
+
+def _get_data_attr(data, key):
+    """Best-effort attribute access on PyG ``Data``-like objects."""
+    val = None
+    if hasattr(data, key):
+        val = getattr(data, key)
+    if val is None:
+        try:
+            if key in data:
+                val = data[key]
+        except Exception:
+            val = None
+    return val
+
+
+def incidence_rank_k_to_sparse(data, rank: int):
+    """
+    Sparse (k-1)-cell to k-cell incidence from ``get_complex_connectivity`` output.
+
+    Accepts torch sparse COO, ``[2, nnz]`` index tensors, or SciPy sparse matrices.
+    """
+    return _to_sparse_coo(_get_data_attr(data, f"incidence_{rank}"))
+
+
+def adjacency_rank_k_to_sparse(data, rank: int):
+    """Sparse rank-k adjacency from ``get_complex_connectivity`` output."""
+    return _to_sparse_coo(_get_data_attr(data, f"adjacency_{rank}"))
 
 
 def incidence_rank_one_to_sparse(data):
@@ -399,6 +433,162 @@ def pick_primary_complex_incidence(data):
                 {"type": "bipartite", "source_rank": k - 1, "target_rank": k},
             )
     return None
+
+
+def _connectivity_keys_present(data, kind: str):
+    """Return ranks of ``{kind}_k`` keys present on ``data`` (sorted ascending)."""
+    ranks = []
+    pattern = re.compile(rf"^{kind}_(\d+)$")
+    for key in _data_keys(data):
+        m = pattern.match(key)
+        if m:
+            ranks.append(int(m.group(1)))
+    return sorted(set(ranks))
+
+
+def enumerate_neighborhoods(data):
+    """
+    List visualizable neighborhoods on a (possibly lifted) ``Data`` object.
+
+    Empty matrices (zero nnz) are filtered out. Order: raw ``graph``,
+    ``hyperedges``, ``incidence_k`` ascending, ``adjacency_k`` ascending.
+
+    Returns
+    -------
+    list[dict]
+        Items shaped like
+        ``{"id": str, "label": str, "kind": str, "rank": int | None}``.
+    """
+    out = []
+
+    adj = edge_index_to_sparse_adj(data)
+    if adj is not None and _sparse_coo_nnz(adj) > 0:
+        nnz = _sparse_coo_nnz(adj)
+        out.append({
+            "id": "graph",
+            "label": f"graph — edge_index adjacency ({nnz:,} nnz)",
+            "kind": "graph",
+            "rank": None,
+        })
+
+    hyper = incidence_to_sparse_incidence(data)
+    if hyper is not None and _sparse_coo_nnz(hyper) > 0:
+        nnz = _sparse_coo_nnz(hyper)
+        out.append({
+            "id": "hyperedges",
+            "label": f"incidence_hyperedges — Rank 0 → hyperedges ({nnz:,} nnz)",
+            "kind": "hyperedges",
+            "rank": None,
+        })
+
+    for k in _connectivity_keys_present(data, "incidence"):
+        sp = incidence_rank_k_to_sparse(data, k)
+        nnz = _sparse_coo_nnz(sp)
+        if nnz == 0:
+            continue
+        out.append({
+            "id": f"incidence_{k}",
+            "label": f"incidence_{k} — Rank {k - 1} → Rank {k} ({nnz:,} nnz)",
+            "kind": "incidence",
+            "rank": k,
+        })
+
+    for k in _connectivity_keys_present(data, "adjacency"):
+        sp = adjacency_rank_k_to_sparse(data, k)
+        nnz = _sparse_coo_nnz(sp)
+        if nnz == 0:
+            continue
+        out.append({
+            "id": f"adjacency_{k}",
+            "label": f"adjacency_{k} — Rank {k} ↔ Rank {k} ({nnz:,} nnz)",
+            "kind": "adjacency",
+            "rank": k,
+        })
+
+    return out
+
+
+def get_named_visualization_matrix(data, neigh_id):
+    """
+    Resolve an explicit neighborhood id to ``(sparse, description, relation_ctx)``.
+
+    Returns ``(None, None, None)`` if the id is not present on ``data``.
+    """
+    if not neigh_id:
+        return None, None, None
+
+    if neigh_id == "graph":
+        adj = edge_index_to_sparse_adj(data)
+        if adj is None:
+            return None, None, None
+        return (
+            adj,
+            "Graph (adjacency from edge_index)",
+            {"type": "adjacency", "source_rank": 0},
+        )
+
+    if neigh_id == "hyperedges":
+        inc = incidence_to_sparse_incidence(data)
+        if inc is None:
+            return None, None, None
+        return (
+            inc,
+            "incidence_hyperedges (Rank 0 → hyperedges)",
+            {"type": "bipartite", "source_rank": 0, "target_kind": "hyperedge"},
+        )
+
+    m = re.match(r"^incidence_(\d+)$", neigh_id)
+    if m:
+        k = int(m.group(1))
+        sp = incidence_rank_k_to_sparse(data, k)
+        if sp is None:
+            return None, None, None
+        return (
+            sp,
+            f"incidence_{k} (Rank {k - 1} → Rank {k})",
+            {"type": "bipartite", "source_rank": max(k - 1, 0), "target_rank": k},
+        )
+
+    m = re.match(r"^adjacency_(\d+)$", neigh_id)
+    if m:
+        k = int(m.group(1))
+        sp = adjacency_rank_k_to_sparse(data, k)
+        if sp is None:
+            return None, None, None
+        return (
+            sp,
+            f"adjacency_{k} (Rank {k} ↔ Rank {k})",
+            {"type": "adjacency", "source_rank": k},
+        )
+
+    return None, None, None
+
+
+def pick_default_neighborhood_id(available):
+    """
+    Pick a sensible default from ``enumerate_neighborhoods`` output.
+
+    Preference order: highest-rank ``incidence_k`` with k>=2, then
+    ``incidence_1``, then ``graph``, then ``hyperedges``, then first item.
+    """
+    if not available:
+        return None
+    by_id = {n["id"]: n for n in available}
+
+    incidence_ranks = sorted(
+        (n["rank"] for n in available if n["kind"] == "incidence"),
+        reverse=True,
+    )
+    for k in incidence_ranks:
+        if k >= 2:
+            return f"incidence_{k}"
+    if any(n["id"] == "incidence_1" for n in available):
+        return "incidence_1"
+    if "graph" in by_id:
+        return "graph"
+    if "hyperedges" in by_id:
+        return "hyperedges"
+    return available[0]["id"]
 
 
 def get_primary_visualization_matrix(data, mode):
@@ -754,7 +944,8 @@ def open_d3_graph_window(payload):
     if payload is None:
         st.warning("No graph to display.")
         return
-    html_doc = build_standalone_d3_html(payload)
+    marker = st.session_state.get("selected_neighborhood_id")
+    html_doc = build_standalone_d3_html(payload, cache_marker=marker)
     st.session_state["_d3_last_html"] = html_doc
     path = Path(tempfile.gettempdir()) / f"topobench_graph_{uuid.uuid4().hex}.html"
     path.write_text(html_doc, encoding="utf-8")
@@ -773,9 +964,19 @@ def open_d3_graph_window(payload):
 
 def _ensure_float_node_features(data):
     """
-    TopoBench feature liftings (e.g. ProjectionSum) use ``torch.matmul`` /
-    ``sparse_mm`` with float sparse incidence; integer ``x`` (common for
-    bag-of-words or raw counts) triggers ``expected scalar type Float but found Long``.
+    Make ``data.x`` lifting-friendly.
+
+    TopoBench liftings touch ``data.x.shape`` while building the NetworkX view
+    (``topobench/transforms/liftings/liftings.py``), so a missing ``x`` raises
+    ``'NoneType' object has no attribute 'shape'``. Some feature liftings
+    (e.g. ``ProjectionSum``) also use ``torch.matmul`` / ``sparse_mm`` with
+    float sparse incidence; integer ``x`` (bag-of-words, raw counts) triggers
+    ``expected scalar type Float but found Long``.
+
+    Behavior:
+    - If ``x`` is ``None`` (or missing): synthesize a ``[num_nodes, 1]`` ones
+      tensor as a placeholder so liftings can iterate over nodes.
+    - If ``x`` exists but is integral: cast to float.
     """
     if data is None or not hasattr(data, "clone"):
         return data
@@ -783,8 +984,20 @@ def _ensure_float_node_features(data):
         d = data.clone()
     except Exception:
         d = data
+
     x = getattr(d, "x", None)
-    if x is not None and hasattr(x, "dtype") and not torch.is_floating_point(x):
+    if x is None:
+        num_nodes = getattr(d, "num_nodes", None)
+        if num_nodes is None:
+            ei = getattr(d, "edge_index", None)
+            if ei is not None and ei.numel() > 0:
+                num_nodes = int(ei.max().item()) + 1
+        if num_nodes is None or num_nodes <= 0:
+            return d
+        d.x = torch.ones((int(num_nodes), 1), dtype=torch.float32)
+        return d
+
+    if hasattr(x, "dtype") and not torch.is_floating_point(x):
         d.x = x.float()
     return d
 
@@ -1049,9 +1262,424 @@ def render_basic_lifting_editor(selected_lifting):
 # Streamlit App
 # ============================================================================
 
+D3_EMBED_HEIGHT = 760
+
+
+def _render_left_config(available_datasets):
+    """Render configuration controls in the Streamlit sidebar; return selections."""
+    st.header("Data configuration")
+
+    with st.expander("Dataset", expanded=True):
+        selected_domain = st.selectbox(
+            "Domain",
+            options=list(available_datasets.keys()),
+            index=0,
+            help="Topological domain (folder under configs/dataset).",
+        )
+        datasets_in_domain = available_datasets.get(selected_domain, [])
+        selected_dataset = st.selectbox(
+            "Dataset",
+            options=datasets_in_domain,
+            index=0,
+            help=f"YAML stem under configs/dataset/{selected_domain}/",
+        )
+        st.caption(f"**{selected_domain}** / **{selected_dataset}**")
+
+    use_lifting = st.toggle(
+        "Use lifting",
+        value=st.session_state.get("use_lifting", False),
+        key="use_lifting",
+    )
+
+    selected_lifting = None
+    edited_lifting_config = None
+    edited_lifting_errors = []
+    if use_lifting:
+        with st.expander("Transform / lifting (optional)", expanded=True):
+            all_liftings = discover_available_liftings()
+            available_for_domain = all_liftings.get(selected_domain, [])
+            if not available_for_domain:
+                st.caption(
+                    f"No liftings configured for domain **{selected_domain}**."
+                )
+                st.session_state["selected_lifting_name"] = None
+            else:
+                targets = sorted(set(l["target"] for l in available_for_domain))
+                previous_target = st.session_state.get("selected_lifting_target")
+                target_index = (
+                    targets.index(previous_target)
+                    if previous_target in targets
+                    else 0
+                )
+                selected_target = st.selectbox(
+                    "Target domain",
+                    options=targets,
+                    index=target_index,
+                    format_func=lambda x: x.capitalize(),
+                )
+                st.session_state["selected_lifting_target"] = selected_target
+                liftings_for_target = [
+                    l for l in available_for_domain if l["target"] == selected_target
+                ]
+                lifting_options = {l["name"]: l for l in liftings_for_target}
+                lifting_names = list(lifting_options.keys())
+                previous_name = st.session_state.get("selected_lifting_name")
+                name_index = (
+                    lifting_names.index(previous_name)
+                    if previous_name in lifting_names
+                    else 0
+                )
+                selected_lifting_name = st.selectbox(
+                    "Lifting method",
+                    options=lifting_names,
+                    index=name_index,
+                )
+                st.session_state["selected_lifting_name"] = selected_lifting_name
+                selected_lifting = lifting_options[selected_lifting_name]
+                edited_lifting_config, edited_lifting_errors = render_basic_lifting_editor(
+                    selected_lifting
+                )
+
+    st.session_state["selected_lifting"] = selected_lifting
+    st.session_state["edited_lifting_config"] = edited_lifting_config
+    st.session_state["edited_lifting_errors"] = edited_lifting_errors
+
+    st.subheader("Graph sampling")
+    max_nodes = st.slider(
+        "Max nodes in graph",
+        min_value=50,
+        max_value=500,
+        value=st.session_state.get("max_nodes", 150),
+        help="Cap on nodes when building the NetworkX view for D3.",
+        key="ui_max_nodes",
+    )
+    min_degree = st.slider(
+        "Minimum degree",
+        min_value=0,
+        max_value=20,
+        value=st.session_state.get("min_degree", 0),
+        key="ui_min_degree",
+    )
+    st.session_state["max_nodes"] = max_nodes
+    st.session_state["min_degree"] = min_degree
+
+    st.subheader("Actions")
+    load_clicked = st.button(
+        "Load graph",
+        type="primary",
+        use_container_width=True,
+        key="load_graph_btn",
+    )
+
+    return {
+        "selected_domain": selected_domain,
+        "selected_dataset": selected_dataset,
+        "use_lifting": use_lifting,
+        "selected_lifting": selected_lifting,
+        "edited_lifting_config": edited_lifting_config,
+        "edited_lifting_errors": edited_lifting_errors,
+        "max_nodes": max_nodes,
+        "min_degree": min_degree,
+        "load_clicked": load_clicked,
+    }
+
+
+def _render_neighborhood_picker():
+    """Neighborhood selectbox for the main page (not the sidebar)."""
+    st.subheader("Available neighborhoods")
+    available = st.session_state.get("available_neighborhoods") or []
+    if not available:
+        st.selectbox(
+            "Neighborhood",
+            options=["(load a dataset first)"],
+            index=0,
+            disabled=True,
+            key="neigh_id_placeholder",
+            help=(
+                "After loading a dataset, every available "
+                "incidence_k / adjacency_k / graph / hyperedges "
+                "neighborhood will appear here."
+            ),
+        )
+        return
+    ids = [n["id"] for n in available]
+    labels = {n["id"]: n["label"] for n in available}
+    prev = st.session_state.get("selected_neighborhood_id")
+    idx = ids.index(prev) if prev in ids else 0
+    st.selectbox(
+        "Neighborhood",
+        options=ids,
+        index=idx,
+        format_func=lambda i: labels.get(i, i),
+        key="neigh_id_select",
+        on_change=_on_neighborhood_change,
+        help=(
+            "Pick the connectivity matrix from the loaded data to "
+            "visualize. Changing this rebuilds the graph immediately "
+            "(no re-lifting)."
+        ),
+    )
+
+
+def _on_neighborhood_change():
+    """Rebuild the embedded view when the neighborhood selection changes."""
+    new_id = st.session_state.get("neigh_id_select")
+    if not new_id:
+        return
+    if st.session_state.get("data") is None:
+        return
+    _rebuild_embed_for_neighborhood(new_id)
+
+
+def _rebuild_embed_for_neighborhood(neigh_id):
+    """Rebuild the embedded D3 view for a specific neighborhood id.
+
+    Reads the cached lifted ``data`` and sampling parameters from
+    ``st.session_state``; on success refreshes ``_d3_embed_html``,
+    ``_d3_last_html``, ``_d3_payload``, ``_d3_caption`` and
+    ``selected_neighborhood_id``. Returns ``True`` on success.
+    """
+    data = st.session_state.get("data")
+    if data is None:
+        st.error("Cannot rebuild graph: no dataset loaded.")
+        return False
+    dset0 = data[0] if hasattr(data, "__getitem__") else data
+
+    rank_labels_for_payload = st.session_state.get("rank_labels") or {}
+    applied_lift = st.session_state.get("lifting_applied")
+    # Sampling sliders only apply on "Load graph"; neighborhood switches reuse
+    # the snapshot from the last successful load.
+    max_nodes = int(
+        st.session_state.get("_loaded_max_nodes", st.session_state.get("max_nodes", 150))
+    )
+    min_degree = int(
+        st.session_state.get(
+            "_loaded_min_degree", st.session_state.get("min_degree", 0)
+        )
+    )
+
+    try:
+        matrix, vdesc, relation_ctx = get_named_visualization_matrix(
+            dset0, neigh_id
+        )
+        if matrix is None:
+            st.error(
+                f"Error building graph payload: neighborhood '{neigh_id}' "
+                "is not available on the loaded data."
+            )
+            return False
+        G_load, nd_load = sparse_to_networkx(
+            matrix,
+            max_nodes=max_nodes,
+            min_degree=min_degree,
+        )
+        if not G_load or len(G_load.nodes()) == 0:
+            st.error(
+                "Error building graph payload: "
+                "graph is empty with current filters."
+            )
+            return False
+        lift_subtitle = (
+            f"Lift: {applied_lift['name']} "
+            f"({applied_lift['source']}→{applied_lift['target']})"
+            if applied_lift is not None
+            else "Lift: none (raw dataset)"
+        )
+        payload = networkx_to_d3_payload(
+            G_load,
+            nd_load,
+            rank_labels=rank_labels_for_payload,
+            plot_title=vdesc,
+            relation_context=relation_ctx,
+            plot_subtitle=lift_subtitle,
+        )
+        if payload is None:
+            st.error("Error building graph payload: payload is empty.")
+            return False
+    except Exception as e:
+        st.error(f"Error building graph payload: {e}")
+        return False
+
+    stats = get_matrix_stats(matrix)
+    embed_html = build_standalone_d3_html(
+        payload,
+        embed=True,
+        chart_min_height=max(360, D3_EMBED_HEIGHT - 80),
+        cache_marker=neigh_id,
+    )
+    download_html = build_standalone_d3_html(payload, cache_marker=neigh_id)
+    st.session_state["_d3_embed_html"] = embed_html
+    st.session_state["_d3_last_html"] = download_html
+    st.session_state["_d3_payload"] = payload
+    st.session_state["_d3_caption"] = (
+        f"{vdesc} — shape {stats['shape']}, "
+        f"{stats['num_edges']:,} nonzeros, density {stats['density']:.4%}"
+        if stats
+        else vdesc
+    )
+    st.session_state["selected_neighborhood_id"] = neigh_id
+    return True
+
+
+def _do_load_graph(cfg):
+    """Build dataset, optional lifting, and embed-ready D3 HTML.
+
+    On success, populates ``st.session_state`` with the new payload/HTML/data
+    and returns ``True``. On any failure, surfaces ``st.error`` and returns
+    ``False`` (without clearing the previously embedded view).
+    """
+    try:
+        raw, loaded_domain = load_dataset(
+            domain=cfg["selected_domain"],
+            dataset_name=cfg["selected_dataset"],
+        )
+    except Exception as e:
+        st.error(f"Error loading dataset: {e}")
+        return False
+
+    try:
+        st.session_state["data_original"] = copy.deepcopy(raw)
+    except Exception:
+        st.session_state["data_original"] = raw
+
+    current_data = raw
+    applied_lift = None
+    if cfg["use_lifting"] and cfg["selected_lifting"] is not None:
+        if cfg["edited_lifting_errors"]:
+            st.error(
+                "Error applying lifting: invalid lifting config.\n- "
+                + "\n- ".join(cfg["edited_lifting_errors"])
+            )
+            return False
+        lifting_payload = copy.deepcopy(cfg["selected_lifting"])
+        if isinstance(cfg["edited_lifting_config"], dict):
+            lifting_payload["config"] = copy.deepcopy(cfg["edited_lifting_config"])
+        try:
+            current_data = [apply_lifting(raw, lifting_payload)]
+            applied_lift = lifting_payload
+        except Exception as e:
+            st.error(f"Error applying lifting: {e}")
+            return False
+
+    st.session_state["data"] = current_data
+    st.session_state["lifting_applied"] = applied_lift
+    st.session_state["data_domain"] = loaded_domain
+    st.session_state["dataset_name"] = cfg["selected_dataset"]
+    dset0 = (
+        current_data[0] if hasattr(current_data, "__getitem__") else current_data
+    )
+    rank_labels_for_payload = get_rank_labels(
+        loaded_domain, cfg["selected_dataset"], dset0
+    )
+    st.session_state["rank_labels"] = rank_labels_for_payload
+
+    available = enumerate_neighborhoods(dset0)
+    st.session_state["available_neighborhoods"] = available
+    if not available:
+        st.error(
+            "No incidence/adjacency neighborhoods are available on this data."
+        )
+        return False
+
+    default_id = pick_default_neighborhood_id(available)
+    st.session_state["selected_neighborhood_id"] = default_id
+    st.session_state["_loaded_max_nodes"] = int(cfg["max_nodes"])
+    st.session_state["_loaded_min_degree"] = int(cfg["min_degree"])
+    # Drop persisted widget values so the main-page picker re-initializes to
+    # ``default_id`` on the next rerun (matches the freshly built embed).
+    st.session_state.pop("neigh_id_select", None)
+    st.session_state.pop("neigh_id_placeholder", None)
+
+    return _rebuild_embed_for_neighborhood(default_id)
+
+
+def _render_right_view():
+    """Render the embedded D3 graph (or a placeholder) in the main area."""
+    st.header("Graph")
+    _render_neighborhood_picker()
+    embed_html = st.session_state.get("_d3_embed_html")
+    if not embed_html:
+        st.info(
+            "Use the **sidebar** to configure the dataset, then click **Load graph**."
+        )
+        return
+
+    data = st.session_state.get("data")
+    dset0 = (
+        data[0] if (data is not None and hasattr(data, "__getitem__")) else data
+    )
+    lifting_applied = st.session_state.get("lifting_applied")
+    if dset0 is not None and hasattr(dset0, "num_nodes"):
+        num_nodes = dset0.num_nodes
+        if (
+            num_nodes is None
+            and getattr(dset0, "edge_index", None) is not None
+        ):
+            num_nodes = int(dset0.edge_index.max().item()) + 1
+        num_features = (
+            dset0.x.shape[1]
+            if (
+                hasattr(dset0, "x")
+                and dset0.x is not None
+                and len(dset0.x.shape) > 1
+            )
+            else 0
+        )
+        if lifting_applied:
+            st.success(
+                f"Viewing lifted data — **{lifting_applied['name']}** "
+                f"({lifting_applied['source']} → {lifting_applied['target']}) | "
+                f"Nodes: {num_nodes}, "
+                f"Node features: {num_features if num_features else 'N/A'}"
+            )
+        else:
+            st.info(
+                f"Dataset loaded — Nodes: {num_nodes}, "
+                f"Node features: {num_features if num_features else 'N/A'}"
+            )
+
+    caption = st.session_state.get("_d3_caption")
+    if caption:
+        st.caption(caption)
+
+    sel = st.session_state.get("selected_neighborhood_id")
+    avail = st.session_state.get("available_neighborhoods") or []
+    label = next((n["label"] for n in avail if n["id"] == sel), sel or "")
+    if sel:
+        st.markdown(f"**Currently displayed:** `{sel}` — {label}")
+
+    # ``components.html`` has no ``key=`` in Streamlit 1.50; wrap in a keyed
+    # container so changing the neighborhood remounts the iframe subtree.
+    neigh_key = st.session_state.get("selected_neighborhood_id", "default")
+    with st.container(key=f"d3_embed::{neigh_key}"):
+        components.html(embed_html, height=D3_EMBED_HEIGHT, scrolling=False)
+
+    payload = st.session_state.get("_d3_payload")
+    if payload is not None and st.button(
+        "Open graph in new browser window",
+        key="d3_open_current",
+        use_container_width=True,
+    ):
+        open_d3_graph_window(payload)
+
+    last_html = st.session_state.get("_d3_last_html")
+    if last_html:
+        st.download_button(
+            label="Download last D3 graph (HTML)",
+            data=last_html,
+            file_name="topobench_graph.html",
+            mime="text/html",
+            key="d3_download_main",
+            use_container_width=True,
+        )
+
+
 def main():
     st.title("Hypergraph Neighborhood Explorer")
-    st.caption("Configure data and optional lifting, then load and open the graph in D3.")
+    st.caption(
+        "Configure data and optional lifting in the **sidebar**, then **Load graph**. "
+        "Use **Available neighborhoods** on this page to switch connectivity views."
+    )
 
     flash = st.session_state.pop("_flash_ok", None)
     if flash:
@@ -1060,316 +1688,15 @@ def main():
     available_datasets = discover_available_datasets()
 
     with st.sidebar:
-        if st.session_state.get("_d3_last_html"):
-            st.download_button(
-                label="Download last D3 graph (HTML)",
-                data=st.session_state["_d3_last_html"],
-                file_name="topobench_graph.html",
-                mime="text/html",
-                key="d3_download_sidebar",
-            )
+        cfg = _render_left_config(available_datasets)
 
-    _, center, _ = st.columns([1, 6, 1])
-    with center:
-        st.header("Data configuration")
+    if cfg["load_clicked"]:
+        with st.spinner("Loading graph…"):
+            ok = _do_load_graph(cfg)
+        if ok:
+            st.rerun()
 
-        with st.expander("Dataset", expanded=True):
-            selected_domain = st.selectbox(
-                "Domain",
-                options=list(available_datasets.keys()),
-                index=0,
-                help="Topological domain (folder under configs/dataset).",
-            )
-            datasets_in_domain = available_datasets.get(selected_domain, [])
-            selected_dataset = st.selectbox(
-                "Dataset",
-                options=datasets_in_domain,
-                index=0,
-                help=f"YAML stem under configs/dataset/{selected_domain}/",
-            )
-            st.caption(f"**{selected_domain}** / **{selected_dataset}**")
-
-        use_lifting = st.toggle(
-            "Use lifting",
-            value=st.session_state.get("use_lifting", False),
-            key="use_lifting",
-        )
-
-        selected_lifting = None
-        edited_lifting_config = None
-        edited_lifting_errors = []
-        if use_lifting:
-            with st.expander("Transform / lifting (optional)", expanded=True):
-                all_liftings = discover_available_liftings()
-                available_for_domain = all_liftings.get(selected_domain, [])
-                if not available_for_domain:
-                    st.caption(f"No liftings configured for domain **{selected_domain}**.")
-                    st.session_state["selected_lifting_name"] = None
-                else:
-                    targets = sorted(set(l["target"] for l in available_for_domain))
-                    previous_target = st.session_state.get("selected_lifting_target")
-                    target_index = (
-                        targets.index(previous_target)
-                        if previous_target in targets
-                        else 0
-                    )
-                    selected_target = st.selectbox(
-                        "Target domain",
-                        options=targets,
-                        index=target_index,
-                        format_func=lambda x: x.capitalize(),
-                    )
-                    st.session_state["selected_lifting_target"] = selected_target
-                    liftings_for_target = [
-                        l for l in available_for_domain if l["target"] == selected_target
-                    ]
-                    lifting_options = {l["name"]: l for l in liftings_for_target}
-                    lifting_names = list(lifting_options.keys())
-                    previous_name = st.session_state.get("selected_lifting_name")
-                    name_index = (
-                        lifting_names.index(previous_name)
-                        if previous_name in lifting_names
-                        else 0
-                    )
-                    selected_lifting_name = st.selectbox(
-                        "Lifting method",
-                        options=lifting_names,
-                        index=name_index,
-                    )
-                    st.session_state["selected_lifting_name"] = selected_lifting_name
-                    selected_lifting = lifting_options[selected_lifting_name]
-                    edited_lifting_config, edited_lifting_errors = render_basic_lifting_editor(
-                        selected_lifting
-                    )
-        else:
-            # Keep last lifting selection in session but do not apply/show it.
-            selected_lifting = None
-
-        # Keep active (possibly hidden) lifting state centralized.
-        st.session_state["selected_lifting"] = selected_lifting
-        st.session_state["edited_lifting_config"] = edited_lifting_config
-        st.session_state["edited_lifting_errors"] = edited_lifting_errors
-
-        st.subheader("Graph sampling")
-        max_nodes = st.slider(
-            "Max nodes in graph",
-            min_value=50,
-            max_value=500,
-            value=150,
-            help="Cap on nodes when building the NetworkX view for D3.",
-        )
-        min_degree = st.slider(
-            "Minimum degree",
-            min_value=0,
-            max_value=20,
-            value=0,
-        )
-        st.session_state["max_nodes"] = max_nodes
-        st.session_state["min_degree"] = min_degree
-
-        st.subheader("Actions")
-        if st.button("Load graph", type="primary", use_container_width=True):
-            with st.spinner("Loading and opening graph…"):
-                # Stage 1: dataset load
-                try:
-                    raw, loaded_domain = load_dataset(
-                        domain=selected_domain, dataset_name=selected_dataset
-                    )
-                except Exception as e:
-                    st.error(f"Error loading dataset: {e}")
-                    return
-
-                # Keep raw snapshot for diagnostics/possible future actions
-                try:
-                    st.session_state["data_original"] = copy.deepcopy(raw)
-                except Exception:
-                    st.session_state["data_original"] = raw
-
-                # Stage 2: optional lifting
-                sel_lift = st.session_state.get("selected_lifting")
-                current_data = raw
-                applied_lift = None
-                if use_lifting and sel_lift is not None:
-                    cfg_errors = st.session_state.get("edited_lifting_errors") or []
-                    if cfg_errors:
-                        st.error(
-                            "Error applying lifting: invalid lifting config.\n- "
-                            + "\n- ".join(cfg_errors)
-                        )
-                        return
-                    effective_cfg = st.session_state.get("edited_lifting_config")
-                    lifting_payload = copy.deepcopy(sel_lift)
-                    if isinstance(effective_cfg, dict):
-                        lifting_payload["config"] = copy.deepcopy(effective_cfg)
-                    try:
-                        current_data = [apply_lifting(raw, lifting_payload)]
-                        applied_lift = lifting_payload
-                    except Exception as e:
-                        st.error(f"Error applying lifting: {e}")
-                        return
-
-                st.session_state["data"] = current_data
-                st.session_state["lifting_applied"] = applied_lift
-                st.session_state["data_domain"] = loaded_domain
-                st.session_state["dataset_name"] = selected_dataset
-                dset0 = (
-                    current_data[0]
-                    if hasattr(current_data, "__getitem__")
-                    else current_data
-                )
-                rank_labels_for_payload = get_rank_labels(
-                    loaded_domain, selected_dataset, dset0
-                )
-                st.session_state["rank_labels"] = rank_labels_for_payload
-
-                # Stage 3: graph payload build
-                try:
-                    matrix, vdesc, relation_ctx = get_primary_visualization_matrix(
-                        dset0, "auto"
-                    )
-                    if matrix is None:
-                        st.error(
-                            "Error building graph payload: "
-                            "no edge_index/incidence connectivity found."
-                        )
-                        return
-                    mx = st.session_state.get("max_nodes", 150)
-                    md = st.session_state.get("min_degree", 0)
-                    G_load, nd_load = sparse_to_networkx(
-                        matrix, max_nodes=mx, min_degree=md
-                    )
-                    if not G_load or len(G_load.nodes()) == 0:
-                        st.error(
-                            "Error building graph payload: "
-                            "graph is empty with current filters."
-                        )
-                        return
-                    lift_subtitle = (
-                        f"Lift: {applied_lift['name']} "
-                        f"({applied_lift['source']}→{applied_lift['target']})"
-                        if applied_lift is not None
-                        else "Lift: none (raw dataset)"
-                    )
-                    payload = networkx_to_d3_payload(
-                        G_load,
-                        nd_load,
-                        rank_labels=rank_labels_for_payload,
-                        plot_title=vdesc,
-                        relation_context=relation_ctx,
-                        plot_subtitle=lift_subtitle,
-                    )
-                    if payload is None:
-                        st.error("Error building graph payload: payload is empty.")
-                        return
-                except Exception as e:
-                    st.error(f"Error building graph payload: {e}")
-                    return
-
-                # Stage 4: open graph
-                try:
-                    open_d3_graph_window(payload)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error opening graph in browser: {e}")
-
-    # ========================================================================
-    # Main Content (after data is loaded)
-    # ========================================================================
-
-    if "data" not in st.session_state:
-        st.info("Use **Load graph** in **Data configuration** above to begin.")
-        return
-    
-    dataset = st.session_state["data"]
-    max_nodes = st.session_state.get("max_nodes", 150)
-    min_degree = st.session_state.get("min_degree", 0)
-
-    data = dataset[0] if hasattr(dataset, "__getitem__") else dataset
-    lifting_applied = st.session_state.get("lifting_applied")
-
-    if not hasattr(data, "num_nodes"):
-        st.warning("Could not determine dataset shape")
-        return
-
-    num_nodes = data.num_nodes
-    if num_nodes is None and hasattr(data, "edge_index") and data.edge_index is not None:
-        num_nodes = int(data.edge_index.max().item()) + 1
-    num_features = (
-        data.x.shape[1]
-        if (hasattr(data, "x") and data.x is not None and len(data.x.shape) > 1)
-        else 0
-    )
-
-    if lifting_applied:
-        st.success(
-            f"⚗️ Viewing lifted data — **{lifting_applied['name']}** "
-            f"({lifting_applied['source']} → {lifting_applied['target']}) | "
-            f"Nodes: {num_nodes}, Node features: {num_features if num_features else 'N/A'}"
-        )
-    else:
-        st.info(
-            f"✅ Dataset loaded! Nodes: {num_nodes}, "
-            f"Node features: {num_features if num_features else 'N/A'}"
-        )
-
-    graph_ok = edge_index_to_sparse_adj(data) is not None
-    inc_ok = (
-        incidence_to_sparse_incidence(data) is not None
-        or pick_primary_complex_incidence(data) is not None
-    )
-    if not (graph_ok or inc_ok):
-        st.warning("No graph/incidence connectivity found for visualization.")
-        return
-
-    data_domain = st.session_state.get("data_domain", "graph")
-    dataset_name = st.session_state.get("dataset_name", "dataset")
-    rank_labels = st.session_state.get("rank_labels") or get_rank_labels(
-        data_domain, dataset_name, data
-    )
-
-    if graph_ok and inc_ok:
-        mode_options = ["auto", "graph", "incidence"]
-    elif graph_ok:
-        mode_options = ["graph"]
-    else:
-        mode_options = ["incidence"]
-    mode_labels = {
-        "auto": "Auto (prefer highest-rank incidence, hyperedges, else graph)",
-        "graph": "Graph (adjacency from pairwise edges)",
-        "incidence": "Incidence",
-    }
-    viz_mode = st.selectbox(
-        "Connectivity view",
-        options=mode_options,
-        format_func=lambda m: mode_labels.get(m, m),
-        key="simple_viz_mode",
-    )
-    matrix, vdesc, relation_ctx = get_primary_visualization_matrix(data, viz_mode)
-    if matrix is None:
-        st.warning("Could not build the selected connectivity view.")
-        return
-
-    stats = get_matrix_stats(matrix)
-    if stats:
-        st.caption(
-            f"{vdesc} — shape {stats['shape']}, "
-            f"{stats['num_edges']:,} nonzeros, density {stats['density']:.4%}"
-        )
-    G, node_degrees = sparse_to_networkx(matrix, max_nodes=max_nodes, min_degree=min_degree)
-    if not G or len(G.nodes()) == 0:
-        st.warning("Graph is empty with the current max-nodes / degree filters.")
-        return
-
-    payload = networkx_to_d3_payload(
-        G,
-        node_degrees,
-        rank_labels=rank_labels,
-        relation_context=relation_ctx,
-        plot_title=vdesc,
-        plot_subtitle=f"{dataset_name} ({data_domain})",
-    )
-    if st.button("Open graph in D3 (new window)", key="d3_open_current", use_container_width=True):
-        open_d3_graph_window(payload)
+    _render_right_view()
 
 
 if __name__ == "__main__":
