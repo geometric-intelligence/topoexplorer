@@ -892,6 +892,169 @@ def networkx_to_d3_payload(
     }
 
 
+# ============================================================================
+# Layered (multi-incidence) builders
+# ============================================================================
+
+def _layered_node_id(rank: int, original_id) -> str:
+    return f"r{int(rank)}_n{int(original_id)}"
+
+
+def build_layered_networkx(
+    incidence_specs,
+    *,
+    max_nodes: int = 200,
+    min_degree: int = 0,
+):
+    """
+    Stack consecutive ``incidence_k`` matrices into a single multi-layer graph.
+
+    Parameters
+    ----------
+    incidence_specs : list[tuple]
+        Each item ``(sparse_matrix, source_rank, target_rank)`` where the
+        sparse matrix is a coalesced COO with shape
+        ``(num_source_cells, num_target_cells)``.
+    max_nodes : int
+        Total node cap; sampling is **stratified per layer** so no rank is
+        wiped out (``ceil(max_nodes / num_layers)`` per layer).
+    min_degree : int
+        Per-node total-degree threshold across all stacked incidences.
+
+    Returns
+    -------
+    tuple
+        ``(G, node_degrees, layers)`` or ``(None, {}, [])`` if empty.
+        - ``G``: ``nx.Graph`` with node attrs ``layer`` (rank) and
+          ``original_id``.
+        - ``node_degrees``: dict keyed by ``G`` node id.
+        - ``layers``: sorted unique ranks.
+    """
+    if not incidence_specs:
+        return None, {}, []
+
+    specs = sorted(
+        [(sp.coalesce() if sp is not None else None, int(sr), int(tr))
+         for sp, sr, tr in incidence_specs if sp is not None],
+        key=lambda t: t[1],
+    )
+    if not specs:
+        return None, {}, []
+
+    raw_edges = []
+    layer_nodes = {}
+    for sp, sr, tr in specs:
+        idx = sp.indices().numpy()
+        for i in range(idx.shape[1]):
+            src_orig = int(idx[0, i])
+            tgt_orig = int(idx[1, i])
+            u = _layered_node_id(sr, src_orig)
+            v = _layered_node_id(tr, tgt_orig)
+            raw_edges.append((u, v))
+            layer_nodes.setdefault(sr, {})[u] = src_orig
+            layer_nodes.setdefault(tr, {})[v] = tgt_orig
+
+    if not raw_edges:
+        return None, {}, []
+
+    degree = {}
+    for u, v in raw_edges:
+        degree[u] = degree.get(u, 0) + 1
+        degree[v] = degree.get(v, 0) + 1
+
+    if min_degree > 0:
+        degree = {n: d for n, d in degree.items() if d >= min_degree}
+    if not degree:
+        return None, {}, []
+
+    layers_sorted = sorted(layer_nodes.keys())
+    num_layers = max(len(layers_sorted), 1)
+    per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
+
+    selected = set()
+    for rank in layers_sorted:
+        candidates = [n for n in layer_nodes[rank] if n in degree]
+        candidates.sort(key=lambda n: degree[n], reverse=True)
+        selected.update(candidates[:per_layer_cap])
+
+    if not selected:
+        return None, {}, []
+
+    G = nx.Graph()
+    for n in selected:
+        rank, orig = None, None
+        for r, mp in layer_nodes.items():
+            if n in mp:
+                rank, orig = r, mp[n]
+                break
+        G.add_node(n, layer=int(rank), original_id=int(orig))
+
+    seen_pairs = set()
+    for u, v in raw_edges:
+        if u not in selected or v not in selected:
+            continue
+        pair = (u, v) if u < v else (v, u)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        G.add_edge(u, v)
+
+    isolated = [n for n in G.nodes() if G.degree(n) == 0]
+    G.remove_nodes_from(isolated)
+    if len(G.nodes()) == 0:
+        return None, {}, []
+
+    node_degrees = {n: G.degree(n) for n in G.nodes()}
+    final_layers = sorted({G.nodes[n]["layer"] for n in G.nodes()})
+    return G, node_degrees, final_layers
+
+
+def networkx_to_layered_d3_payload(
+    G,
+    node_degrees,
+    layers,
+    *,
+    rank_labels=None,
+    plot_title=None,
+    plot_subtitle=None,
+):
+    """Build a layered D3 payload (``graphType = 'layered'``)."""
+    if G is None or len(G.nodes()) == 0:
+        return None
+
+    rank_labels = rank_labels or {}
+    layers_sorted = sorted(layers) if layers else sorted(
+        {G.nodes[n].get("layer", 0) for n in G.nodes()}
+    )
+
+    nodes_out = []
+    for n in G.nodes():
+        rank = int(G.nodes[n].get("layer", 0))
+        orig = G.nodes[n].get("original_id", n)
+        nodes_out.append({
+            "id": str(n),
+            "label": f"rank_{rank}_id={orig}",
+            "degree": _json_safe_float(node_degrees.get(n, G.degree(n))),
+            "color": rank_color(rank),
+            "stroke": "#fff",
+            "layer": rank,
+        })
+
+    links_out = [{"source": str(u), "target": str(v)} for u, v in G.edges()]
+
+    return {
+        "graphType": "layered",
+        "title": plot_title or "Layered incidences",
+        "subtitle": plot_subtitle or "",
+        "nodes": nodes_out,
+        "links": links_out,
+        "layers": [int(r) for r in layers_sorted],
+        "layerLabels": {
+            str(r): rank_labels.get(r, f"Rank {r}") for r in layers_sorted
+        },
+    }
+
+
 def launch_html_in_browser(path: Path) -> bool:
     """
     Open a local HTML file in a real browser.
@@ -944,7 +1107,8 @@ def open_d3_graph_window(payload):
     if payload is None:
         st.warning("No graph to display.")
         return
-    marker = st.session_state.get("selected_neighborhood_id")
+    sel_ids = st.session_state.get("selected_neighborhood_ids") or []
+    marker = "+".join(sel_ids) if sel_ids else None
     html_doc = build_standalone_d3_html(payload, cache_marker=marker)
     st.session_state["_d3_last_html"] = html_doc
     path = Path(tempfile.gettempdir()) / f"topobench_graph_{uuid.uuid4().hex}.html"
@@ -1236,17 +1400,19 @@ def render_basic_lifting_editor(selected_lifting):
     if errors:
         st.error("Invalid lifting config:\n- " + "\n- ".join(errors))
 
-    c_reset, _ = st.columns([1, 3])
-    with c_reset:
-        if st.button("Reset edited config to defaults", key=f"cfg_reset::{editor_id}"):
-            for k in BASIC_EDITABLE_KEYS:
-                wk = f"editcfg::{editor_id}::{k}"
-                if wk in st.session_state:
-                    del st.session_state[wk]
-            st.session_state["editable_lifting_config"] = copy.deepcopy(
-                selected_lifting.get("config", {})
-            )
-            st.rerun()
+    if st.button(
+        "Reset edited config to defaults",
+        key=f"cfg_reset::{editor_id}",
+        use_container_width=True,
+    ):
+        for k in BASIC_EDITABLE_KEYS:
+            wk = f"editcfg::{editor_id}::{k}"
+            if wk in st.session_state:
+                del st.session_state[wk]
+        st.session_state["editable_lifting_config"] = copy.deepcopy(
+            selected_lifting.get("config", {})
+        )
+        st.rerun()
 
     with st.expander("Config preview", expanded=False):
         cfg_display = {
@@ -1384,61 +1550,189 @@ def _render_left_config(available_datasets):
     }
 
 
+def _split_neighborhoods(available):
+    """Bucket available neighborhoods into the three picker boxes."""
+    graph_ids = [n["id"] for n in available if n["kind"] in ("graph", "hyperedges")]
+    incidence = [n for n in available if n["kind"] == "incidence"]
+    adjacency = [n for n in available if n["kind"] == "adjacency"]
+    incidence.sort(key=lambda n: n.get("rank", 0))
+    adjacency.sort(key=lambda n: n.get("rank", 0))
+    return graph_ids, incidence, adjacency
+
+
 def _render_neighborhood_picker():
-    """Neighborhood selectbox for the main page (not the sidebar)."""
+    """Three boxes (Graph radio / Incidence checklist / Adjacency radio)."""
     st.subheader("Available neighborhoods")
     available = st.session_state.get("available_neighborhoods") or []
     if not available:
-        st.selectbox(
-            "Neighborhood",
-            options=["(load a dataset first)"],
-            index=0,
-            disabled=True,
-            key="neigh_id_placeholder",
-            help=(
-                "After loading a dataset, every available "
-                "incidence_k / adjacency_k / graph / hyperedges "
-                "neighborhood will appear here."
-            ),
+        st.info(
+            "Load a dataset to enable neighborhood selection. After loading, "
+            "you can pick one **Graph** entry, one or more **Incidence** "
+            "entries (stacked bottom-to-top), or one **Adjacency** entry."
         )
         return
-    ids = [n["id"] for n in available]
-    labels = {n["id"]: n["label"] for n in available}
-    prev = st.session_state.get("selected_neighborhood_id")
-    idx = ids.index(prev) if prev in ids else 0
-    st.selectbox(
-        "Neighborhood",
-        options=ids,
-        index=idx,
-        format_func=lambda i: labels.get(i, i),
-        key="neigh_id_select",
-        on_change=_on_neighborhood_change,
-        help=(
-            "Pick the connectivity matrix from the loaded data to "
-            "visualize. Changing this rebuilds the graph immediately "
-            "(no re-lifting)."
-        ),
+
+    graph_ids, incidence_items, adjacency_items = _split_neighborhoods(
+        available
     )
+    label_map = {n["id"]: n["label"] for n in available}
+    selected_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+
+    # Make sure every picker widget key exists in state BEFORE the widgets
+    # render. _sync_picker_widget_state is idempotent and writes the values
+    # consistent with the current selected_neighborhood_ids -- this avoids
+    # ever falling back to st.radio's `index=` parameter on first render
+    # (which has been observed to fire spurious on_change callbacks that
+    # silently clobber the selection).
+    _sync_picker_widget_state(selected_ids)
+
+    with st.container(border=True):
+        st.markdown("**Graph**")
+        if graph_ids:
+            options = ["(none)"] + graph_ids
+            st.radio(
+                "Graph view",
+                options=options,
+                format_func=lambda i: "(none)" if i == "(none)" else label_map.get(i, i),
+                key="graph_radio",
+                on_change=_on_graph_pick,
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("No graph / hyperedges neighborhood on this data.")
+
+    with st.container(border=True):
+        st.markdown("**Incidence** (stacked bottom-to-top by rank)")
+        if incidence_items:
+            for item in incidence_items:
+                st.checkbox(
+                    item["label"],
+                    key=f"inc_{item['id']}_check",
+                    on_change=_on_incidence_toggle,
+                )
+        else:
+            st.caption("No incidence_k neighborhoods on this data.")
+
+    with st.container(border=True):
+        st.markdown("**Adjacency**")
+        if adjacency_items:
+            adj_ids = [n["id"] for n in adjacency_items]
+            options = ["(none)"] + adj_ids
+            st.radio(
+                "Adjacency view",
+                options=options,
+                format_func=lambda i: "(none)" if i == "(none)" else label_map.get(i, i),
+                key="adj_radio",
+                on_change=_on_adjacency_pick,
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("No adjacency_k neighborhoods on this data.")
 
 
-def _on_neighborhood_change():
-    """Rebuild the embedded view when the neighborhood selection changes."""
-    new_id = st.session_state.get("neigh_id_select")
-    if not new_id:
-        return
+def _sync_picker_widget_state(selected_ids):
+    """Force every picker widget key to match ``selected_ids``.
+
+    This is the single source of truth for picker widget state. Calling this
+    in every callback guarantees that on the next rerun the radios and
+    checkboxes render with values consistent with ``selected_neighborhood_ids``,
+    avoiding the fragile pop + ``index=`` re-initialization dance (which was
+    causing incidence checkboxes to silently uncheck themselves).
+    """
+    available = st.session_state.get("available_neighborhoods") or []
+    selected_set = set(selected_ids)
+
+    graph_options = [
+        n["id"] for n in available if n["kind"] in ("graph", "hyperedges")
+    ]
+    if graph_options:
+        chosen = next((g for g in graph_options if g in selected_set), "(none)")
+        st.session_state["graph_radio"] = chosen
+
+    adj_options = [n["id"] for n in available if n["kind"] == "adjacency"]
+    if adj_options:
+        chosen = next((a for a in adj_options if a in selected_set), "(none)")
+        st.session_state["adj_radio"] = chosen
+
+    for n in available:
+        if n["kind"] == "incidence":
+            st.session_state[f"inc_{n['id']}_check"] = n["id"] in selected_set
+
+
+def _on_graph_pick():
+    """Selecting a Graph option becomes the sole selection.
+
+    Picking ``(none)`` is treated as a no-op: the current selection (whatever
+    it is) is preserved. This avoids accidentally wiping the selection when
+    the radio re-renders with no graph option active.
+    """
     if st.session_state.get("data") is None:
         return
-    _rebuild_embed_for_neighborhood(new_id)
+    pick = st.session_state.get("graph_radio")
+    if not pick or pick == "(none)":
+        # Re-sync widgets to current selection (in case user tried to deselect).
+        _sync_picker_widget_state(
+            st.session_state.get("selected_neighborhood_ids") or []
+        )
+        return
+    _commit_selection([pick])
 
 
-def _rebuild_embed_for_neighborhood(neigh_id):
-    """Rebuild the embedded D3 view for a specific neighborhood id.
+def _on_incidence_toggle():
+    """Toggling an incidence checkbox replaces the selection with the
+    set of currently-checked incidences."""
+    if st.session_state.get("data") is None:
+        return
+    incidence_ids = [
+        n["id"] for n in st.session_state.get("available_neighborhoods") or []
+        if n["kind"] == "incidence"
+    ]
+    new_ids = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
+    if not new_ids:
+        # Don't allow ending with no selection -- restore one previously-checked
+        # incidence so the layered view always has something to display.
+        prev = list(st.session_state.get("selected_neighborhood_ids") or [])
+        prev_inc = [p for p in prev if p in incidence_ids]
+        if not prev_inc:
+            return
+        new_ids = [prev_inc[0]]
+    _commit_selection(new_ids)
 
-    Reads the cached lifted ``data`` and sampling parameters from
-    ``st.session_state``; on success refreshes ``_d3_embed_html``,
-    ``_d3_last_html``, ``_d3_payload``, ``_d3_caption`` and
-    ``selected_neighborhood_id``. Returns ``True`` on success.
+
+def _on_adjacency_pick():
+    """Selecting an Adjacency option becomes the sole selection.
+
+    Picking ``(none)`` is treated as a no-op: the current selection is
+    preserved (see ``_on_graph_pick``).
     """
+    if st.session_state.get("data") is None:
+        return
+    pick = st.session_state.get("adj_radio")
+    if not pick or pick == "(none)":
+        _sync_picker_widget_state(
+            st.session_state.get("selected_neighborhood_ids") or []
+        )
+        return
+    _commit_selection([pick])
+
+
+def _commit_selection(new_ids):
+    """Persist the selection, sync all picker widgets, rebuild the embed."""
+    new_ids = list(new_ids)
+    st.session_state["selected_neighborhood_ids"] = new_ids
+    _sync_picker_widget_state(new_ids)
+    _rebuild_embed_for_neighborhoods(new_ids)
+
+
+def _rebuild_embed_for_neighborhoods(neigh_ids):
+    """Rebuild the embedded D3 view for a list of neighborhood ids.
+
+    A single non-incidence id falls through to the original single-matrix
+    pipeline. Multiple incidence ids (or any incidence selection) goes
+    through the layered pipeline (stacked ranks bottom-to-top).
+    """
+    if not neigh_ids:
+        return False
     data = st.session_state.get("data")
     if data is None:
         st.error("Cannot rebuild graph: no dataset loaded.")
@@ -1450,7 +1744,9 @@ def _rebuild_embed_for_neighborhood(neigh_id):
     # Sampling sliders only apply on "Load graph"; neighborhood switches reuse
     # the snapshot from the last successful load.
     max_nodes = int(
-        st.session_state.get("_loaded_max_nodes", st.session_state.get("max_nodes", 150))
+        st.session_state.get(
+            "_loaded_max_nodes", st.session_state.get("max_nodes", 150)
+        )
     )
     min_degree = int(
         st.session_state.get(
@@ -1458,41 +1754,103 @@ def _rebuild_embed_for_neighborhood(neigh_id):
         )
     )
 
+    lift_subtitle = (
+        f"Lift: {applied_lift['name']} "
+        f"({applied_lift['source']}→{applied_lift['target']})"
+        if applied_lift is not None
+        else "Lift: none (raw dataset)"
+    )
+
+    incidence_ids = [i for i in neigh_ids if i.startswith("incidence_")
+                     and i != "incidence_hyperedges"]
+    use_layered = (
+        len(incidence_ids) >= 1
+        and len(incidence_ids) == len(neigh_ids)
+    )
+
     try:
-        matrix, vdesc, relation_ctx = get_named_visualization_matrix(
-            dset0, neigh_id
-        )
-        if matrix is None:
-            st.error(
-                f"Error building graph payload: neighborhood '{neigh_id}' "
-                "is not available on the loaded data."
+        if use_layered:
+            specs = []
+            for nid in incidence_ids:
+                k = int(nid.split("_", 1)[1])
+                sp = incidence_rank_k_to_sparse(dset0, k)
+                if sp is None:
+                    st.error(f"Neighborhood '{nid}' is not available.")
+                    return False
+                specs.append((sp, k - 1, k))
+
+            ranks_chosen = sorted({sr for _, sr, _ in specs}
+                                  | {tr for _, _, tr in specs})
+            expected = list(range(min(ranks_chosen), max(ranks_chosen) + 1))
+            if ranks_chosen != expected:
+                missing = sorted(set(expected) - set(ranks_chosen))
+                st.info(
+                    "Selected incidences are not contiguous in rank; "
+                    f"missing rank(s): {missing}. Layers will still render "
+                    "but unrelated ranks may not connect."
+                )
+
+            G_load, nd_load, layers = build_layered_networkx(
+                specs, max_nodes=max_nodes, min_degree=min_degree
             )
-            return False
-        G_load, nd_load = sparse_to_networkx(
-            matrix,
-            max_nodes=max_nodes,
-            min_degree=min_degree,
-        )
-        if not G_load or len(G_load.nodes()) == 0:
-            st.error(
-                "Error building graph payload: "
-                "graph is empty with current filters."
+            if not G_load or len(G_load.nodes()) == 0:
+                st.error(
+                    "Error building graph payload: "
+                    "no nodes survive current filters for the selected layers."
+                )
+                return False
+
+            sorted_inc = sorted(incidence_ids,
+                                key=lambda x: int(x.split("_", 1)[1]))
+            vdesc = "Layered: " + " | ".join(sorted_inc)
+            payload = networkx_to_layered_d3_payload(
+                G_load,
+                nd_load,
+                layers,
+                rank_labels=rank_labels_for_payload,
+                plot_title=vdesc,
+                plot_subtitle=lift_subtitle,
             )
-            return False
-        lift_subtitle = (
-            f"Lift: {applied_lift['name']} "
-            f"({applied_lift['source']}→{applied_lift['target']})"
-            if applied_lift is not None
-            else "Lift: none (raw dataset)"
-        )
-        payload = networkx_to_d3_payload(
-            G_load,
-            nd_load,
-            rank_labels=rank_labels_for_payload,
-            plot_title=vdesc,
-            relation_context=relation_ctx,
-            plot_subtitle=lift_subtitle,
-        )
+            caption_extra = (
+                f"{len(G_load.nodes()):,} nodes across "
+                f"{len(layers)} layer(s); {len(G_load.edges()):,} edges"
+            )
+        else:
+            single_id = neigh_ids[0]
+            matrix, vdesc, relation_ctx = get_named_visualization_matrix(
+                dset0, single_id
+            )
+            if matrix is None:
+                st.error(
+                    f"Error building graph payload: neighborhood "
+                    f"'{single_id}' is not available on the loaded data."
+                )
+                return False
+            G_load, nd_load = sparse_to_networkx(
+                matrix, max_nodes=max_nodes, min_degree=min_degree
+            )
+            if not G_load or len(G_load.nodes()) == 0:
+                st.error(
+                    "Error building graph payload: "
+                    "graph is empty with current filters."
+                )
+                return False
+            payload = networkx_to_d3_payload(
+                G_load,
+                nd_load,
+                rank_labels=rank_labels_for_payload,
+                plot_title=vdesc,
+                relation_context=relation_ctx,
+                plot_subtitle=lift_subtitle,
+            )
+            stats = get_matrix_stats(matrix)
+            caption_extra = (
+                f"shape {stats['shape']}, {stats['num_edges']:,} nonzeros, "
+                f"density {stats['density']:.4%}"
+                if stats
+                else ""
+            )
+
         if payload is None:
             st.error("Error building graph payload: payload is empty.")
             return False
@@ -1500,24 +1858,21 @@ def _rebuild_embed_for_neighborhood(neigh_id):
         st.error(f"Error building graph payload: {e}")
         return False
 
-    stats = get_matrix_stats(matrix)
+    cache_marker = "+".join(neigh_ids)
     embed_html = build_standalone_d3_html(
         payload,
         embed=True,
         chart_min_height=max(360, D3_EMBED_HEIGHT - 80),
-        cache_marker=neigh_id,
+        cache_marker=cache_marker,
     )
-    download_html = build_standalone_d3_html(payload, cache_marker=neigh_id)
+    download_html = build_standalone_d3_html(payload, cache_marker=cache_marker)
     st.session_state["_d3_embed_html"] = embed_html
     st.session_state["_d3_last_html"] = download_html
     st.session_state["_d3_payload"] = payload
     st.session_state["_d3_caption"] = (
-        f"{vdesc} — shape {stats['shape']}, "
-        f"{stats['num_edges']:,} nonzeros, density {stats['density']:.4%}"
-        if stats
-        else vdesc
+        f"{vdesc} — {caption_extra}" if caption_extra else vdesc
     )
-    st.session_state["selected_neighborhood_id"] = neigh_id
+    st.session_state["selected_neighborhood_ids"] = list(neigh_ids)
     return True
 
 
@@ -1582,15 +1937,15 @@ def _do_load_graph(cfg):
         return False
 
     default_id = pick_default_neighborhood_id(available)
-    st.session_state["selected_neighborhood_id"] = default_id
+    default_ids = [default_id] if default_id else []
+    st.session_state["selected_neighborhood_ids"] = default_ids
     st.session_state["_loaded_max_nodes"] = int(cfg["max_nodes"])
     st.session_state["_loaded_min_degree"] = int(cfg["min_degree"])
-    # Drop persisted widget values so the main-page picker re-initializes to
-    # ``default_id`` on the next rerun (matches the freshly built embed).
-    st.session_state.pop("neigh_id_select", None)
-    st.session_state.pop("neigh_id_placeholder", None)
+    # Sync picker widget keys to the freshly-loaded default selection
+    # (also overwrites any stale values from a previous Load).
+    _sync_picker_widget_state(default_ids)
 
-    return _rebuild_embed_for_neighborhood(default_id)
+    return _rebuild_embed_for_neighborhoods(default_ids)
 
 
 def _render_right_view():
@@ -1642,15 +1997,17 @@ def _render_right_view():
     if caption:
         st.caption(caption)
 
-    sel = st.session_state.get("selected_neighborhood_id")
+    sel_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
     avail = st.session_state.get("available_neighborhoods") or []
-    label = next((n["label"] for n in avail if n["id"] == sel), sel or "")
-    if sel:
-        st.markdown(f"**Currently displayed:** `{sel}` — {label}")
+    if sel_ids:
+        labels = [next((n["label"] for n in avail if n["id"] == s), s) for s in sel_ids]
+        joined_ids = ", ".join(f"`{s}`" for s in sel_ids)
+        joined_labels = "; ".join(labels)
+        st.markdown(f"**Currently displayed:** {joined_ids} — {joined_labels}")
 
     # ``components.html`` has no ``key=`` in Streamlit 1.50; wrap in a keyed
     # container so changing the neighborhood remounts the iframe subtree.
-    neigh_key = st.session_state.get("selected_neighborhood_id", "default")
+    neigh_key = "+".join(sel_ids) if sel_ids else "default"
     with st.container(key=f"d3_embed::{neigh_key}"):
         components.html(embed_html, height=D3_EMBED_HEIGHT, scrolling=False)
 

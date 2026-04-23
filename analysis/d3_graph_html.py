@@ -157,6 +157,48 @@ def build_standalone_d3_html(
           .force("y", d3.forceY(function(d) {
             return d.layer === 0 ? height * 0.24 : height * 0.76;
           }).strength(0.9));
+      } else if (payload.graphType === "layered") {
+        var layers = (payload.layers || []).slice().sort(function(a, b) { return a - b; });
+        if (layers.length === 0) {
+          var ls = new Set();
+          nodes.forEach(function(n) { ls.add(n.layer || 0); });
+          layers = Array.from(ls).sort(function(a, b) { return a - b; });
+        }
+        var topPad = 60;
+        var bottomPad = 40;
+        var usable = Math.max(120, height - topPad - bottomPad);
+        var step = layers.length > 1 ? usable / (layers.length - 1) : 0;
+        var layerY = {};
+        layers.forEach(function(rank, i) {
+          // Lowest rank at the bottom, highest rank at the top.
+          var idxFromTop = layers.length - 1 - i;
+          layerY[String(rank)] = topPad + idxFromTop * step;
+        });
+        simulation
+          .force("x", d3.forceX(width / 2).strength(0.05))
+          .force("y", d3.forceY(function(d) {
+            var y = layerY[String(d.layer)];
+            return (y === undefined) ? height / 2 : y;
+          }).strength(1.1));
+
+        var bandG = g.append("g").attr("class", "layer-bands");
+        var labelDict = payload.layerLabels || {};
+        layers.forEach(function(rank) {
+          var y = layerY[String(rank)];
+          if (y === undefined) return;
+          bandG.append("line")
+            .attr("x1", 0).attr("x2", width)
+            .attr("y1", y).attr("y2", y)
+            .attr("stroke", "#ccc")
+            .attr("stroke-dasharray", "4 6")
+            .attr("stroke-width", 1);
+          bandG.append("text")
+            .attr("x", width - 8).attr("y", y - 6)
+            .attr("text-anchor", "end")
+            .attr("fill", "#666")
+            .attr("font-size", "11px")
+            .text(labelDict[String(rank)] || ("Rank " + rank));
+        });
       } else {
         simulation.force("center", d3.forceCenter(width / 2, height / 2));
       }
