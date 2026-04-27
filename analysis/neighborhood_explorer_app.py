@@ -9,6 +9,7 @@ Run with: streamlit run analysis/neighborhood_explorer_app.py
 import sys
 import os
 import copy
+import json
 import re
 import math
 import platform
@@ -427,10 +428,11 @@ def pick_primary_complex_incidence(data):
             sp = incidence_rank_k_to_sparse(data, k)
             if sp is None or _sparse_coo_nnz(sp) == 0:
                 continue
+            src_rank = max(k - 1, 0)
             return (
                 sp,
-                f"Rank-{k - 1} to rank-{k} incidence",
-                {"type": "bipartite", "source_rank": k - 1, "target_rank": k},
+                f"Rank-{src_rank} to rank-{k} incidence",
+                {"type": "bipartite", "source_rank": src_rank, "target_rank": k},
             )
     return None
 
@@ -482,6 +484,10 @@ def enumerate_neighborhoods(data):
         })
 
     for k in _connectivity_keys_present(data, "incidence"):
+        # ``incidence_0`` can appear in some liftings as an augmentation artifact.
+        # Hide it from user-facing neighborhoods to avoid confusing "Rank -1" labels.
+        if k <= 0:
+            continue
         sp = incidence_rank_k_to_sparse(data, k)
         nnz = _sparse_coo_nnz(sp)
         if nnz == 0:
@@ -540,13 +546,16 @@ def get_named_visualization_matrix(data, neigh_id):
     m = re.match(r"^incidence_(\d+)$", neigh_id)
     if m:
         k = int(m.group(1))
+        if k <= 0:
+            return None, None, None
         sp = incidence_rank_k_to_sparse(data, k)
         if sp is None:
             return None, None, None
+        src_rank = max(k - 1, 0)
         return (
             sp,
-            f"incidence_{k} (Rank {k - 1} → Rank {k})",
-            {"type": "bipartite", "source_rank": max(k - 1, 0), "target_rank": k},
+            f"incidence_{k} (Rank {src_rank} → Rank {k})",
+            {"type": "bipartite", "source_rank": src_rank, "target_rank": k},
         )
 
     m = re.match(r"^adjacency_(\d+)$", neigh_id)
@@ -589,6 +598,148 @@ def pick_default_neighborhood_id(available):
     if "hyperedges" in by_id:
         return "hyperedges"
     return available[0]["id"]
+
+
+def _discover_rank_populations(data):
+    """Infer per-rank populations (N_k) and optional hyperedge count."""
+    populations = {}
+
+    def _set_rank(rank, count):
+        try:
+            rank_i = int(rank)
+            count_i = int(count)
+        except Exception:
+            return
+        if count_i < 0:
+            return
+        populations[rank_i] = max(populations.get(rank_i, 0), count_i)
+
+    num_nodes = getattr(data, "num_nodes", None)
+    if num_nodes is not None:
+        _set_rank(0, num_nodes)
+
+    graph_adj = edge_index_to_sparse_adj(data)
+    if graph_adj is not None:
+        _set_rank(0, int(graph_adj.shape[0]))
+
+    for k in _connectivity_keys_present(data, "incidence"):
+        sp = incidence_rank_k_to_sparse(data, k)
+        if sp is None:
+            continue
+        sp = sp.coalesce()
+        _set_rank(max(k - 1, 0), int(sp.shape[0]))
+        _set_rank(k, int(sp.shape[1]))
+
+    for k in _connectivity_keys_present(data, "adjacency"):
+        sp = adjacency_rank_k_to_sparse(data, k)
+        if sp is None:
+            continue
+        sp = sp.coalesce()
+        _set_rank(k, int(sp.shape[0]))
+
+    hyper = incidence_to_sparse_incidence(data)
+    num_hyperedges = None
+    if hyper is not None:
+        hyper = hyper.coalesce()
+        _set_rank(0, int(hyper.shape[0]))
+        num_hyperedges = int(hyper.shape[1])
+    elif getattr(data, "num_hyperedges", None) is not None:
+        try:
+            num_hyperedges = int(getattr(data, "num_hyperedges"))
+        except Exception:
+            num_hyperedges = None
+
+    return dict(sorted(populations.items())), num_hyperedges
+
+
+def compute_shared_node_sampling(data, *, caps_by_rank, cap_hyperedges=None):
+    """Compute canonical sampled node ids per rank for cross-view consistency."""
+    rank_pops, num_hyperedges = _discover_rank_populations(data)
+    degree_by_rank = {r: {} for r in rank_pops}
+    hyper_degree = {}
+
+    def _add_rank_degree(rank, node_id, delta=1):
+        rank = int(rank)
+        node_id = int(node_id)
+        mp = degree_by_rank.setdefault(rank, {})
+        mp[node_id] = mp.get(node_id, 0) + int(delta)
+
+    def _count_adjacency(sp, rank):
+        sp = sp.coalesce()
+        idx = sp.indices().numpy()
+        seen_pairs = set()
+        for i in range(idx.shape[1]):
+            u = int(idx[0, i])
+            v = int(idx[1, i])
+            if u == v:
+                continue
+            pair = (u, v) if u < v else (v, u)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            _add_rank_degree(rank, pair[0], 1)
+            _add_rank_degree(rank, pair[1], 1)
+
+    graph_adj = edge_index_to_sparse_adj(data)
+    if graph_adj is not None:
+        _count_adjacency(graph_adj, 0)
+
+    for k in _connectivity_keys_present(data, "adjacency"):
+        sp = adjacency_rank_k_to_sparse(data, k)
+        if sp is None:
+            continue
+        _count_adjacency(sp, k)
+
+    for k in _connectivity_keys_present(data, "incidence"):
+        sp = incidence_rank_k_to_sparse(data, k)
+        if sp is None:
+            continue
+        sp = sp.coalesce()
+        idx = sp.indices().numpy()
+        src_rank = max(k - 1, 0)
+        for i in range(idx.shape[1]):
+            _add_rank_degree(src_rank, int(idx[0, i]), 1)
+            _add_rank_degree(k, int(idx[1, i]), 1)
+
+    hyper = incidence_to_sparse_incidence(data)
+    if hyper is not None:
+        hyper = hyper.coalesce()
+        idx = hyper.indices().numpy()
+        for i in range(idx.shape[1]):
+            src = int(idx[0, i])
+            he = int(idx[1, i])
+            _add_rank_degree(0, src, 1)
+            hyper_degree[he] = hyper_degree.get(he, 0) + 1
+
+    selected_by_rank = {}
+    normalized_caps = {}
+    for rank, pop in rank_pops.items():
+        cap = caps_by_rank.get(rank, min(150, pop))
+        cap = max(0, min(int(cap), int(pop)))
+        normalized_caps[rank] = cap
+
+        deg_map = degree_by_rank.get(rank, {})
+        candidates = list(range(int(pop)))
+        candidates.sort(key=lambda node_id: (-deg_map.get(node_id, 0), int(node_id)))
+        selected_by_rank[rank] = frozenset(candidates[:cap])
+
+    selected_hyperedges = None
+    if num_hyperedges is not None:
+        if cap_hyperedges is None:
+            cap_hyperedges = min(150, int(num_hyperedges))
+        cap_hyperedges = max(0, min(int(cap_hyperedges), int(num_hyperedges)))
+        hyper_candidates = list(range(int(num_hyperedges)))
+        hyper_candidates.sort(key=lambda he: (-hyper_degree.get(he, 0), int(he)))
+        selected_hyperedges = frozenset(hyper_candidates[:cap_hyperedges])
+
+    return {
+        "selected_by_rank": selected_by_rank,
+        "aggregate_degree_by_rank": degree_by_rank,
+        "selected_hyperedges": selected_hyperedges,
+        "caps_by_rank": normalized_caps,
+        "rank_populations": rank_pops,
+        "num_hyperedges": num_hyperedges,
+    }
 
 
 def get_primary_visualization_matrix(data, mode):
@@ -692,86 +843,108 @@ def get_matrix_stats(sparse_tensor):
 # Graph Conversion Functions
 # ============================================================================
 
-def sparse_to_networkx(sparse_tensor, max_nodes=200, min_degree=0):
-    """Convert sparse tensor to NetworkX graph with filtering."""
+def sparse_to_networkx(
+    sparse_tensor,
+    max_nodes=200,
+    min_degree=0,
+    *,
+    allowed_source=None,
+    allowed_target=None,
+):
+    """Convert sparse tensor to NetworkX graph with filtering and optional masks."""
     if sparse_tensor is None:
         return None, {}
-    
+
     sparse_tensor = sparse_tensor.coalesce()
     indices = sparse_tensor.indices().numpy()
     n_edges = indices.shape[1]
-    
     if n_edges == 0:
         return None, {}
-    
-    # Determine if adjacency (square) or incidence (rectangular)
-    is_adjacency = sparse_tensor.shape[0] == sparse_tensor.shape[1]
 
-    # Compute node degrees
+    is_adjacency = sparse_tensor.shape[0] == sparse_tensor.shape[1]
+    source_allowed = set(allowed_source) if allowed_source is not None else None
+    target_allowed = set(allowed_target) if allowed_target is not None else None
+    if is_adjacency and target_allowed is None:
+        target_allowed = source_allowed
+
     node_degrees = {}
     if is_adjacency:
-        # Adjacency may contain both (u,v) and (v,u). Count each undirected pair once.
         seen_pairs = set()
+        kept_pairs = []
         for i in range(n_edges):
-            src, tgt = int(indices[0, i]), int(indices[1, i])
+            src = int(indices[0, i])
+            tgt = int(indices[1, i])
             if src == tgt:
+                continue
+            if source_allowed is not None and src not in source_allowed:
+                continue
+            if target_allowed is not None and tgt not in target_allowed:
                 continue
             pair = (src, tgt) if src < tgt else (tgt, src)
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
+            kept_pairs.append(pair)
             u, v = pair
             node_degrees[u] = node_degrees.get(u, 0) + 1
             node_degrees[v] = node_degrees.get(v, 0) + 1
     else:
+        kept_pairs = []
         for i in range(n_edges):
-            src, tgt = int(indices[0, i]), int(indices[1, i])
+            src = int(indices[0, i])
+            tgt = int(indices[1, i])
+            if source_allowed is not None and src not in source_allowed:
+                continue
+            if target_allowed is not None and tgt not in target_allowed:
+                continue
+            kept_pairs.append((src, tgt))
             node_degrees[src] = node_degrees.get(src, 0) + 1
             node_degrees[tgt] = node_degrees.get(tgt, 0) + 1
-    
-    # Filter by minimum degree
+
     if min_degree > 0:
         node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
-
     if not node_degrees:
         return None, {}
 
-    # Sample top nodes if too many
-    if len(node_degrees) > max_nodes:
-        top_nodes = sorted(node_degrees.keys(), key=lambda x: node_degrees[x], reverse=True)[:max_nodes]
+    # Legacy fallback for callers not using canonical masks.
+    if source_allowed is None and target_allowed is None and len(node_degrees) > max_nodes:
+        top_nodes = sorted(
+            node_degrees.keys(),
+            key=lambda node_id: (-node_degrees[node_id], int(node_id)),
+        )[:max_nodes]
         node_degrees = {k: node_degrees[k] for k in top_nodes}
-    
+
     valid_nodes = set(node_degrees.keys())
-    
     if is_adjacency:
         G = nx.Graph()
         for node in valid_nodes:
             G.add_node(node, degree=node_degrees[node])
-        
-        for i in range(n_edges):
-            src, tgt = indices[0, i], indices[1, i]
-            if src in valid_nodes and tgt in valid_nodes and src != tgt:
+        for src, tgt in kept_pairs:
+            if src in valid_nodes and tgt in valid_nodes:
                 G.add_edge(src, tgt)
     else:
-        # Bipartite graph
         G = nx.DiGraph()
-        src_nodes = set(indices[0])
-        tgt_nodes = set(indices[1])
-        
-        for node in src_nodes:
-            if node in valid_nodes:
-                G.add_node(f"src_{node}", bipartite=0, original_id=node)
-        for node in tgt_nodes:
-            if node in valid_nodes:
-                G.add_node(f"tgt_{node}", bipartite=1, original_id=node)
-        
-        for i in range(n_edges):
-            src, tgt = indices[0, i], indices[1, i]
+        src_present = set()
+        tgt_present = set()
+        for src, tgt in kept_pairs:
+            if src in valid_nodes:
+                src_present.add(src)
+            if tgt in valid_nodes:
+                tgt_present.add(tgt)
+
+        for node in src_present:
+            G.add_node(f"src_{node}", bipartite=0, original_id=node)
+        for node in tgt_present:
+            G.add_node(f"tgt_{node}", bipartite=1, original_id=node)
+
+        for src, tgt in kept_pairs:
             src_key = f"src_{src}"
             tgt_key = f"tgt_{tgt}"
-            if src_key in G.nodes() and tgt_key in G.nodes():
+            if src_key in G and tgt_key in G:
                 G.add_edge(src_key, tgt_key)
-    
+
+    if len(G.nodes()) == 0:
+        return None, {}
     return G, node_degrees
 
 
@@ -905,6 +1078,7 @@ def build_layered_networkx(
     *,
     max_nodes: int = 200,
     min_degree: int = 0,
+    selected_by_rank=None,
 ):
     """
     Stack consecutive ``incidence_k`` matrices into a single multi-layer graph.
@@ -968,14 +1142,255 @@ def build_layered_networkx(
         return None, {}, []
 
     layers_sorted = sorted(layer_nodes.keys())
-    num_layers = max(len(layers_sorted), 1)
-    per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
 
     selected = set()
-    for rank in layers_sorted:
-        candidates = [n for n in layer_nodes[rank] if n in degree]
-        candidates.sort(key=lambda n: degree[n], reverse=True)
-        selected.update(candidates[:per_layer_cap])
+    if selected_by_rank is not None:
+        for rank in layers_sorted:
+            chosen_ids = set(selected_by_rank.get(int(rank), set()))
+            for node_id in chosen_ids:
+                lid = _layered_node_id(rank, node_id)
+                if lid in degree:
+                    selected.add(lid)
+    else:
+        num_layers = max(len(layers_sorted), 1)
+        per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
+        for rank in layers_sorted:
+            candidates = [n for n in layer_nodes[rank] if n in degree]
+            candidates.sort(key=lambda n: degree[n], reverse=True)
+            selected.update(candidates[:per_layer_cap])
+
+    if not selected:
+        return None, {}, []
+
+    G = nx.Graph()
+    for n in selected:
+        rank, orig = None, None
+        for r, mp in layer_nodes.items():
+            if n in mp:
+                rank, orig = r, mp[n]
+                break
+        G.add_node(n, layer=int(rank), original_id=int(orig))
+
+    seen_pairs = set()
+    for u, v in raw_edges:
+        if u not in selected or v not in selected:
+            continue
+        pair = (u, v) if u < v else (v, u)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        G.add_edge(u, v)
+
+    isolated = [n for n in G.nodes() if G.degree(n) == 0]
+    G.remove_nodes_from(isolated)
+    if len(G.nodes()) == 0:
+        return None, {}, []
+
+    node_degrees = {n: G.degree(n) for n in G.nodes()}
+    final_layers = sorted({G.nodes[n]["layer"] for n in G.nodes()})
+    return G, node_degrees, final_layers
+
+
+def build_layered_adjacency_networkx(
+    adjacency_specs,
+    *,
+    max_nodes: int = 200,
+    min_degree: int = 0,
+    selected_by_rank=None,
+):
+    """Stack multiple ``adjacency_k`` matrices into a layered rank-wise graph."""
+    if not adjacency_specs:
+        return None, {}, []
+
+    specs = sorted(
+        [(sp.coalesce() if sp is not None else None, int(rank))
+         for sp, rank in adjacency_specs if sp is not None],
+        key=lambda t: t[1],
+    )
+    if not specs:
+        return None, {}, []
+
+    raw_edges = []
+    layer_nodes = {}
+    for sp, rank in specs:
+        idx = sp.indices().numpy()
+        seen_pairs = set()
+        for i in range(idx.shape[1]):
+            src_orig = int(idx[0, i])
+            tgt_orig = int(idx[1, i])
+            if src_orig == tgt_orig:
+                continue
+            pair = (
+                (src_orig, tgt_orig)
+                if src_orig < tgt_orig
+                else (tgt_orig, src_orig)
+            )
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            u = _layered_node_id(rank, pair[0])
+            v = _layered_node_id(rank, pair[1])
+            raw_edges.append((u, v))
+            layer_nodes.setdefault(rank, {})[u] = pair[0]
+            layer_nodes.setdefault(rank, {})[v] = pair[1]
+
+    if not raw_edges:
+        return None, {}, []
+
+    degree = {}
+    for u, v in raw_edges:
+        degree[u] = degree.get(u, 0) + 1
+        degree[v] = degree.get(v, 0) + 1
+
+    if min_degree > 0:
+        degree = {n: d for n, d in degree.items() if d >= min_degree}
+    if not degree:
+        return None, {}, []
+
+    layers_sorted = sorted(layer_nodes.keys())
+    selected = set()
+    if selected_by_rank is not None:
+        for rank in layers_sorted:
+            chosen_ids = set(selected_by_rank.get(int(rank), set()))
+            for node_id in chosen_ids:
+                lid = _layered_node_id(rank, node_id)
+                if lid in degree:
+                    selected.add(lid)
+    else:
+        num_layers = max(len(layers_sorted), 1)
+        per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
+        for rank in layers_sorted:
+            candidates = [n for n in layer_nodes[rank] if n in degree]
+            candidates.sort(key=lambda n: degree[n], reverse=True)
+            selected.update(candidates[:per_layer_cap])
+
+    if not selected:
+        return None, {}, []
+
+    G = nx.Graph()
+    for n in selected:
+        rank, orig = None, None
+        for r, mp in layer_nodes.items():
+            if n in mp:
+                rank, orig = r, mp[n]
+                break
+        G.add_node(n, layer=int(rank), original_id=int(orig))
+
+    seen_pairs = set()
+    for u, v in raw_edges:
+        if u not in selected or v not in selected:
+            continue
+        pair = (u, v) if u < v else (v, u)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        G.add_edge(u, v)
+
+    isolated = [n for n in G.nodes() if G.degree(n) == 0]
+    G.remove_nodes_from(isolated)
+    if len(G.nodes()) == 0:
+        return None, {}, []
+
+    node_degrees = {n: G.degree(n) for n in G.nodes()}
+    final_layers = sorted({G.nodes[n]["layer"] for n in G.nodes()})
+    return G, node_degrees, final_layers
+
+
+def build_combined_layered_networkx(
+    incidence_specs,
+    adjacency_specs,
+    *,
+    max_nodes: int = 200,
+    min_degree: int = 0,
+    selected_by_rank=None,
+):
+    """Build a layered graph from incidence (cross-rank) + adjacency (within-rank)."""
+    specs_inc = sorted(
+        [
+            (sp.coalesce() if sp is not None else None, int(sr), int(tr))
+            for sp, sr, tr in incidence_specs
+            if sp is not None
+        ],
+        key=lambda t: t[1],
+    )
+    specs_adj = sorted(
+        [
+            (sp.coalesce() if sp is not None else None, int(rank))
+            for sp, rank in adjacency_specs
+            if sp is not None
+        ],
+        key=lambda t: t[1],
+    )
+    if not specs_inc and not specs_adj:
+        return None, {}, []
+
+    raw_edges = []
+    layer_nodes = {}
+
+    # Cross-rank incidence edges.
+    for sp, sr, tr in specs_inc:
+        idx = sp.indices().numpy()
+        for i in range(idx.shape[1]):
+            src_orig = int(idx[0, i])
+            tgt_orig = int(idx[1, i])
+            u = _layered_node_id(sr, src_orig)
+            v = _layered_node_id(tr, tgt_orig)
+            raw_edges.append((u, v))
+            layer_nodes.setdefault(sr, {})[u] = src_orig
+            layer_nodes.setdefault(tr, {})[v] = tgt_orig
+
+    # Within-rank adjacency edges.
+    for sp, rank in specs_adj:
+        idx = sp.indices().numpy()
+        seen_pairs = set()
+        for i in range(idx.shape[1]):
+            src_orig = int(idx[0, i])
+            tgt_orig = int(idx[1, i])
+            if src_orig == tgt_orig:
+                continue
+            pair = (
+                (src_orig, tgt_orig)
+                if src_orig < tgt_orig
+                else (tgt_orig, src_orig)
+            )
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            u = _layered_node_id(rank, pair[0])
+            v = _layered_node_id(rank, pair[1])
+            raw_edges.append((u, v))
+            layer_nodes.setdefault(rank, {})[u] = pair[0]
+            layer_nodes.setdefault(rank, {})[v] = pair[1]
+
+    if not raw_edges:
+        return None, {}, []
+
+    degree = {}
+    for u, v in raw_edges:
+        degree[u] = degree.get(u, 0) + 1
+        degree[v] = degree.get(v, 0) + 1
+
+    if min_degree > 0:
+        degree = {n: d for n, d in degree.items() if d >= min_degree}
+    if not degree:
+        return None, {}, []
+
+    layers_sorted = sorted(layer_nodes.keys())
+    selected = set()
+    if selected_by_rank is not None:
+        for rank in layers_sorted:
+            chosen_ids = set(selected_by_rank.get(int(rank), set()))
+            for node_id in chosen_ids:
+                lid = _layered_node_id(rank, node_id)
+                if lid in degree:
+                    selected.add(lid)
+    else:
+        num_layers = max(len(layers_sorted), 1)
+        per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
+        for rank in layers_sorted:
+            candidates = [n for n in layer_nodes[rank] if n in degree]
+            candidates.sort(key=lambda n: degree[n], reverse=True)
+            selected.update(candidates[:per_layer_cap])
 
     if not selected:
         return None, {}, []
@@ -1209,6 +1624,33 @@ def apply_lifting(data, lifting_info):
     # PyG BaseTransform.__call__ -> forward(data) -> transformed Data
     transformed = transform(single)
     return transformed
+
+
+@st.cache_resource(show_spinner=False)
+def _load_dataset_cached(domain, dataset_name):
+    """Cache raw dataset objects by domain/name."""
+    return load_dataset(domain=domain, dataset_name=dataset_name)
+
+
+@st.cache_resource(show_spinner=False)
+def _apply_lifting_cached(
+    domain,
+    dataset_name,
+    lifting_name,
+    lifting_source,
+    lifting_target,
+    lifting_config_json,
+):
+    """Cache lifted data by dataset + lifting identity + config."""
+    raw, _ = _load_dataset_cached(domain=domain, dataset_name=dataset_name)
+    raw_copy = copy.deepcopy(raw)
+    payload = {
+        "name": lifting_name,
+        "source": lifting_source,
+        "target": lifting_target,
+        "config": json.loads(lifting_config_json),
+    }
+    return apply_lifting(raw_copy, payload)
 
 
 BASIC_EDITABLE_KEYS = {
@@ -1511,14 +1953,102 @@ def _render_left_config(available_datasets):
     st.session_state["edited_lifting_errors"] = edited_lifting_errors
 
     st.subheader("Graph sampling")
-    max_nodes = st.slider(
-        "Max nodes in graph",
-        min_value=50,
-        max_value=500,
-        value=st.session_state.get("max_nodes", 150),
-        help="Cap on nodes when building the NetworkX view for D3.",
-        key="ui_max_nodes",
-    )
+    loaded_data = st.session_state.get("data")
+    dset0 = loaded_data[0] if (loaded_data is not None and hasattr(loaded_data, "__getitem__")) else loaded_data
+    rank_populations = {}
+    hyperedge_population = None
+    if dset0 is not None:
+        rank_populations, hyperedge_population = _discover_rank_populations(dset0)
+
+    ui_rank_caps = {}
+    ui_hyperedge_cap = None
+    if rank_populations:
+        max_rank_pop = max(rank_populations.values()) if rank_populations else 0
+        with st.expander("Per-rank node caps", expanded=True):
+            st.caption(
+                "Set how many nodes to keep per rank on the next **Load graph**."
+            )
+
+            if int(max_rank_pop) >= 2:
+                all_cap_default = int(
+                    st.session_state.get("ui_set_all_rank_caps", 150)
+                )
+                all_cap = st.number_input(
+                    "Set all ranks to",
+                    min_value=0,
+                    max_value=int(max_rank_pop),
+                    value=max(0, min(all_cap_default, int(max_rank_pop))),
+                    step=1,
+                    key="ui_set_all_rank_caps",
+                )
+                if st.button(
+                    "Apply to all rank caps",
+                    use_container_width=True,
+                    key="ui_apply_all_rank_caps",
+                ):
+                    for rank, pop in rank_populations.items():
+                        if int(pop) >= 2:
+                            st.session_state[f"ui_rank_cap_{rank}"] = max(
+                                0, min(int(all_cap), int(pop))
+                            )
+                    st.rerun()
+
+            rank_labels = st.session_state.get("rank_labels") or {}
+            for rank, pop in sorted(rank_populations.items()):
+                pop_int = int(pop)
+                label_prefix = rank_labels.get(rank, f"Rank {rank}")
+                if pop_int <= 1:
+                    ui_rank_caps[int(rank)] = pop_int
+                    st.caption(
+                        f"{label_prefix}: {pop_int} node(s) — slider hidden."
+                    )
+                    continue
+
+                key = f"ui_rank_cap_{rank}"
+                default_cap = min(150, pop_int)
+                value_cap = int(st.session_state.get(key, default_cap))
+                ui_rank_caps[int(rank)] = st.slider(
+                    f"{label_prefix} cap",
+                    min_value=0,
+                    max_value=pop_int,
+                    value=max(0, min(value_cap, pop_int)),
+                    key=key,
+                )
+
+            if hyperedge_population is not None:
+                hyper_pop_int = int(hyperedge_population)
+                if hyper_pop_int <= 1:
+                    ui_hyperedge_cap = hyper_pop_int
+                    st.caption(
+                        f"Hyperedges: {hyper_pop_int} — slider hidden."
+                    )
+                else:
+                    hyper_default = min(150, hyper_pop_int)
+                    hyper_value = int(
+                        st.session_state.get("ui_hyperedge_cap", hyper_default)
+                    )
+                    ui_hyperedge_cap = st.slider(
+                        "Hyperedge cap",
+                        min_value=0,
+                        max_value=hyper_pop_int,
+                        value=max(0, min(hyper_value, hyper_pop_int)),
+                        key="ui_hyperedge_cap",
+                    )
+    else:
+        max_nodes = st.slider(
+            "Max nodes in graph (fallback before first load)",
+            min_value=50,
+            max_value=500,
+            value=st.session_state.get("max_nodes", 150),
+            help=(
+                "Before loading data we don't know available ranks yet. "
+                "After loading, this becomes per-rank sliders."
+            ),
+            key="ui_max_nodes",
+        )
+        ui_rank_caps = {0: int(max_nodes)}
+        ui_hyperedge_cap = None
+
     min_degree = st.slider(
         "Minimum degree",
         min_value=0,
@@ -1526,7 +2056,8 @@ def _render_left_config(available_datasets):
         value=st.session_state.get("min_degree", 0),
         key="ui_min_degree",
     )
-    st.session_state["max_nodes"] = max_nodes
+    st.session_state["rank_caps"] = {str(k): int(v) for k, v in ui_rank_caps.items()}
+    st.session_state["max_nodes"] = int(ui_rank_caps.get(0, st.session_state.get("max_nodes", 150)))
     st.session_state["min_degree"] = min_degree
 
     st.subheader("Actions")
@@ -1544,7 +2075,9 @@ def _render_left_config(available_datasets):
         "selected_lifting": selected_lifting,
         "edited_lifting_config": edited_lifting_config,
         "edited_lifting_errors": edited_lifting_errors,
-        "max_nodes": max_nodes,
+        "caps_by_rank": ui_rank_caps,
+        "hyperedge_cap": ui_hyperedge_cap,
+        "max_nodes": int(ui_rank_caps.get(0, st.session_state.get("max_nodes", 150))),
         "min_degree": min_degree,
         "load_clicked": load_clicked,
     }
@@ -1567,11 +2100,12 @@ def _render_neighborhood_picker():
     if not available:
         st.info(
             "Load a dataset to enable neighborhood selection. After loading, "
-            "you can pick one **Graph** entry, one or more **Incidence** "
-            "entries (stacked bottom-to-top), or one **Adjacency** entry."
+            "you can pick one **Graph** entry, or any combination of "
+            "**Incidence** and **Adjacency** entries "
+            "(stacked bottom-to-top by rank)."
         )
         return
-
+    
     graph_ids, incidence_items, adjacency_items = _split_neighborhoods(
         available
     )
@@ -1616,16 +2150,12 @@ def _render_neighborhood_picker():
     with st.container(border=True):
         st.markdown("**Adjacency**")
         if adjacency_items:
-            adj_ids = [n["id"] for n in adjacency_items]
-            options = ["(none)"] + adj_ids
-            st.radio(
-                "Adjacency view",
-                options=options,
-                format_func=lambda i: "(none)" if i == "(none)" else label_map.get(i, i),
-                key="adj_radio",
-                on_change=_on_adjacency_pick,
-                label_visibility="collapsed",
-            )
+            for item in adjacency_items:
+                st.checkbox(
+                    item["label"],
+                    key=f"adj_{item['id']}_check",
+                    on_change=_on_adjacency_toggle,
+                )
         else:
             st.caption("No adjacency_k neighborhoods on this data.")
 
@@ -1649,14 +2179,11 @@ def _sync_picker_widget_state(selected_ids):
         chosen = next((g for g in graph_options if g in selected_set), "(none)")
         st.session_state["graph_radio"] = chosen
 
-    adj_options = [n["id"] for n in available if n["kind"] == "adjacency"]
-    if adj_options:
-        chosen = next((a for a in adj_options if a in selected_set), "(none)")
-        st.session_state["adj_radio"] = chosen
-
     for n in available:
         if n["kind"] == "incidence":
             st.session_state[f"inc_{n['id']}_check"] = n["id"] in selected_set
+        elif n["kind"] == "adjacency":
+            st.session_state[f"adj_{n['id']}_check"] = n["id"] in selected_set
 
 
 def _on_graph_pick():
@@ -1679,41 +2206,63 @@ def _on_graph_pick():
 
 
 def _on_incidence_toggle():
-    """Toggling an incidence checkbox replaces the selection with the
-    set of currently-checked incidences."""
+    """Toggling an incidence checkbox keeps the union of checked
+    incidences and adjacencies."""
     if st.session_state.get("data") is None:
         return
+    available = st.session_state.get("available_neighborhoods") or []
     incidence_ids = [
-        n["id"] for n in st.session_state.get("available_neighborhoods") or []
+        n["id"] for n in available
         if n["kind"] == "incidence"
     ]
-    new_ids = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
+    adjacency_ids = [
+        n["id"] for n in available
+        if n["kind"] == "adjacency"
+    ]
+    picked_inc = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
+    picked_adj = [i for i in adjacency_ids if st.session_state.get(f"adj_{i}_check")]
+    new_ids = picked_inc + picked_adj
     if not new_ids:
-        # Don't allow ending with no selection -- restore one previously-checked
-        # incidence so the layered view always has something to display.
-        prev = list(st.session_state.get("selected_neighborhood_ids") or [])
-        prev_inc = [p for p in prev if p in incidence_ids]
-        if not prev_inc:
+        graph_pick = st.session_state.get("graph_radio")
+        if graph_pick and graph_pick != "(none)":
+            _commit_selection([graph_pick])
             return
-        new_ids = [prev_inc[0]]
+        prev = list(st.session_state.get("selected_neighborhood_ids") or [])
+        prev_layered = [p for p in prev if p in incidence_ids or p in adjacency_ids]
+        if not prev_layered:
+            return
+        new_ids = [prev_layered[0]]
     _commit_selection(new_ids)
 
 
-def _on_adjacency_pick():
-    """Selecting an Adjacency option becomes the sole selection.
-
-    Picking ``(none)`` is treated as a no-op: the current selection is
-    preserved (see ``_on_graph_pick``).
-    """
+def _on_adjacency_toggle():
+    """Toggling an adjacency checkbox keeps the union of checked
+    incidences and adjacencies."""
     if st.session_state.get("data") is None:
         return
-    pick = st.session_state.get("adj_radio")
-    if not pick or pick == "(none)":
-        _sync_picker_widget_state(
-            st.session_state.get("selected_neighborhood_ids") or []
-        )
-        return
-    _commit_selection([pick])
+    available = st.session_state.get("available_neighborhoods") or []
+    adjacency_ids = [
+        n["id"] for n in available
+        if n["kind"] == "adjacency"
+    ]
+    incidence_ids = [
+        n["id"] for n in available
+        if n["kind"] == "incidence"
+    ]
+    picked_adj = [i for i in adjacency_ids if st.session_state.get(f"adj_{i}_check")]
+    picked_inc = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
+    new_ids = picked_inc + picked_adj
+    if not new_ids:
+        graph_pick = st.session_state.get("graph_radio")
+        if graph_pick and graph_pick != "(none)":
+            _commit_selection([graph_pick])
+            return
+        prev = list(st.session_state.get("selected_neighborhood_ids") or [])
+        prev_layered = [p for p in prev if p in incidence_ids or p in adjacency_ids]
+        if not prev_layered:
+            return
+        new_ids = [prev_layered[0]]
+    _commit_selection(new_ids)
 
 
 def _commit_selection(new_ids):
@@ -1728,8 +2277,8 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     """Rebuild the embedded D3 view for a list of neighborhood ids.
 
     A single non-incidence id falls through to the original single-matrix
-    pipeline. Multiple incidence ids (or any incidence selection) goes
-    through the layered pipeline (stacked ranks bottom-to-top).
+    pipeline. Multiple incidence ids or multiple adjacency ids go through
+    layered pipelines (stacked ranks bottom-to-top).
     """
     if not neigh_ids:
         return False
@@ -1741,6 +2290,9 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
 
     rank_labels_for_payload = st.session_state.get("rank_labels") or {}
     applied_lift = st.session_state.get("lifting_applied")
+    shared_sampling = st.session_state.get("_shared_sampling") or {}
+    shared_by_rank = shared_sampling.get("selected_by_rank") or {}
+    shared_hyperedges = shared_sampling.get("selected_hyperedges")
     # Sampling sliders only apply on "Load graph"; neighborhood switches reuse
     # the snapshot from the last successful load.
     max_nodes = int(
@@ -1761,23 +2313,119 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         else "Lift: none (raw dataset)"
     )
 
-    incidence_ids = [i for i in neigh_ids if i.startswith("incidence_")
-                     and i != "incidence_hyperedges"]
+    incidence_ids = [
+        i for i in neigh_ids
+        if i.startswith("incidence_") and i != "incidence_hyperedges"
+    ]
+    adjacency_ids = [i for i in neigh_ids if i.startswith("adjacency_")]
+    non_layered_ids = [
+        i for i in neigh_ids if i not in incidence_ids and i not in adjacency_ids
+    ]
+    use_combined = (
+        len(incidence_ids) >= 1
+        and len(adjacency_ids) >= 1
+        and not non_layered_ids
+    )
     use_layered = (
+        not use_combined
+        and
         len(incidence_ids) >= 1
         and len(incidence_ids) == len(neigh_ids)
     )
+    use_layered_adj = (
+        not use_combined
+        and
+        len(adjacency_ids) >= 2
+        and len(adjacency_ids) == len(neigh_ids)
+    )
 
     try:
-        if use_layered:
-            specs = []
+        if use_combined:
+            incidence_specs = []
             for nid in incidence_ids:
                 k = int(nid.split("_", 1)[1])
+                if k <= 0:
+                    continue
                 sp = incidence_rank_k_to_sparse(dset0, k)
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                specs.append((sp, k - 1, k))
+                incidence_specs.append((sp, max(k - 1, 0), k))
+
+            adjacency_specs = []
+            for nid in adjacency_ids:
+                k = int(nid.split("_", 1)[1])
+                sp = adjacency_rank_k_to_sparse(dset0, k)
+                if sp is None:
+                    st.error(f"Neighborhood '{nid}' is not available.")
+                    return False
+                adjacency_specs.append((sp, k))
+
+            if not incidence_specs or not adjacency_specs:
+                st.error(
+                    "Combined rendering requires at least one valid incidence_k "
+                    "and one valid adjacency_k."
+                )
+                return False
+
+            ranks_chosen = sorted(
+                {sr for _, sr, _ in incidence_specs}
+                | {tr for _, _, tr in incidence_specs}
+                | {rank for _, rank in adjacency_specs}
+            )
+            G_load, nd_load, layers = build_combined_layered_networkx(
+                incidence_specs,
+                adjacency_specs,
+                max_nodes=max_nodes,
+                min_degree=min_degree,
+                selected_by_rank=(
+                    {int(r): set(shared_by_rank.get(int(r), set())) for r in ranks_chosen}
+                    if shared_by_rank
+                    else None
+                ),
+            )
+            if not G_load or len(G_load.nodes()) == 0:
+                st.error(
+                    "Error building graph payload: "
+                    "no nodes survive current filters for the selected combined layers."
+                )
+                return False
+
+            sorted_inc = sorted(incidence_ids, key=lambda x: int(x.split("_", 1)[1]))
+            sorted_adj = sorted(adjacency_ids, key=lambda x: int(x.split("_", 1)[1]))
+            vdesc = (
+                "Layered: "
+                + ", ".join(sorted_inc)
+                + " + "
+                + ", ".join(sorted_adj)
+            )
+            payload = networkx_to_layered_d3_payload(
+                G_load,
+                nd_load,
+                layers,
+                rank_labels=rank_labels_for_payload,
+                plot_title=vdesc,
+                plot_subtitle=lift_subtitle,
+            )
+            caption_extra = (
+                f"{len(G_load.nodes()):,} nodes across "
+                f"{len(layers)} layer(s); {len(G_load.edges()):,} edges"
+            )
+        elif use_layered:
+            specs = []
+            for nid in incidence_ids:
+                k = int(nid.split("_", 1)[1])
+                if k <= 0:
+                    continue
+                sp = incidence_rank_k_to_sparse(dset0, k)
+                if sp is None:
+                    st.error(f"Neighborhood '{nid}' is not available.")
+                    return False
+                specs.append((sp, max(k - 1, 0), k))
+
+            if not specs:
+                st.error("No valid incidence_k (k>=1) selected for layered rendering.")
+                return False
 
             ranks_chosen = sorted({sr for _, sr, _ in specs}
                                   | {tr for _, _, tr in specs})
@@ -1791,7 +2439,14 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 )
 
             G_load, nd_load, layers = build_layered_networkx(
-                specs, max_nodes=max_nodes, min_degree=min_degree
+                specs,
+                max_nodes=max_nodes,
+                min_degree=min_degree,
+                selected_by_rank=(
+                    {int(r): set(shared_by_rank.get(int(r), set())) for r in ranks_chosen}
+                    if shared_by_rank
+                    else None
+                ),
             )
             if not G_load or len(G_load.nodes()) == 0:
                 st.error(
@@ -1815,6 +2470,52 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 f"{len(G_load.nodes()):,} nodes across "
                 f"{len(layers)} layer(s); {len(G_load.edges()):,} edges"
             )
+        elif use_layered_adj:
+            specs = []
+            for nid in adjacency_ids:
+                k = int(nid.split("_", 1)[1])
+                sp = adjacency_rank_k_to_sparse(dset0, k)
+                if sp is None:
+                    st.error(f"Neighborhood '{nid}' is not available.")
+                    return False
+                specs.append((sp, k))
+
+            if not specs:
+                st.error("No valid adjacency_k selected for layered rendering.")
+                return False
+
+            ranks_chosen = sorted({rank for _, rank in specs})
+            G_load, nd_load, layers = build_layered_adjacency_networkx(
+                specs,
+                max_nodes=max_nodes,
+                min_degree=min_degree,
+                selected_by_rank=(
+                    {int(r): set(shared_by_rank.get(int(r), set())) for r in ranks_chosen}
+                    if shared_by_rank
+                    else None
+                ),
+            )
+            if not G_load or len(G_load.nodes()) == 0:
+                st.error(
+                    "Error building graph payload: "
+                    "no nodes survive current filters for the selected adjacency layers."
+                )
+                return False
+
+            sorted_adj = sorted(adjacency_ids, key=lambda x: int(x.split("_", 1)[1]))
+            vdesc = "Layered adjacency: " + " | ".join(sorted_adj)
+            payload = networkx_to_layered_d3_payload(
+                G_load,
+                nd_load,
+                layers,
+                rank_labels=rank_labels_for_payload,
+                plot_title=vdesc,
+                plot_subtitle=lift_subtitle,
+            )
+            caption_extra = (
+                f"{len(G_load.nodes()):,} nodes across "
+                f"{len(layers)} layer(s); {len(G_load.edges()):,} edges"
+            )
         else:
             single_id = neigh_ids[0]
             matrix, vdesc, relation_ctx = get_named_visualization_matrix(
@@ -1826,8 +2527,32 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                     f"'{single_id}' is not available on the loaded data."
                 )
                 return False
+
+            allowed_source = None
+            allowed_target = None
+            if shared_by_rank:
+                if single_id == "graph":
+                    allowed_source = set(shared_by_rank.get(0, set()))
+                    allowed_target = set(shared_by_rank.get(0, set()))
+                elif single_id.startswith("adjacency_"):
+                    k = int(single_id.split("_", 1)[1])
+                    allowed_source = set(shared_by_rank.get(k, set()))
+                    allowed_target = set(shared_by_rank.get(k, set()))
+                elif single_id.startswith("incidence_"):
+                    k = int(single_id.split("_", 1)[1])
+                    allowed_source = set(shared_by_rank.get(max(k - 1, 0), set()))
+                    allowed_target = set(shared_by_rank.get(k, set()))
+                elif single_id == "hyperedges":
+                    allowed_source = set(shared_by_rank.get(0, set()))
+                    if shared_hyperedges is not None:
+                        allowed_target = set(shared_hyperedges)
+
             G_load, nd_load = sparse_to_networkx(
-                matrix, max_nodes=max_nodes, min_degree=min_degree
+                matrix,
+                max_nodes=max_nodes,
+                min_degree=min_degree,
+                allowed_source=allowed_source,
+                allowed_target=allowed_target,
             )
             if not G_load or len(G_load.nodes()) == 0:
                 st.error(
@@ -1876,18 +2601,23 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     return True
 
 
-def _do_load_graph(cfg):
+def _do_load_graph(cfg, progress=None):
     """Build dataset, optional lifting, and embed-ready D3 HTML.
 
     On success, populates ``st.session_state`` with the new payload/HTML/data
     and returns ``True``. On any failure, surfaces ``st.error`` and returns
     ``False`` (without clearing the previously embedded view).
     """
+    if progress is None:
+        progress = lambda _msg: None
+
+    progress("Loading dataset")
     try:
-        raw, loaded_domain = load_dataset(
+        raw_cached, loaded_domain = _load_dataset_cached(
             domain=cfg["selected_domain"],
             dataset_name=cfg["selected_dataset"],
         )
+        raw = copy.deepcopy(raw_cached)
     except Exception as e:
         st.error(f"Error loading dataset: {e}")
         return False
@@ -1909,8 +2639,22 @@ def _do_load_graph(cfg):
         lifting_payload = copy.deepcopy(cfg["selected_lifting"])
         if isinstance(cfg["edited_lifting_config"], dict):
             lifting_payload["config"] = copy.deepcopy(cfg["edited_lifting_config"])
+        progress("Applying lifting transform")
         try:
-            current_data = [apply_lifting(raw, lifting_payload)]
+            lifting_cfg_json = json.dumps(
+                lifting_payload.get("config") or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            lifted = _apply_lifting_cached(
+                cfg["selected_domain"],
+                cfg["selected_dataset"],
+                lifting_payload.get("name", ""),
+                lifting_payload.get("source", ""),
+                lifting_payload.get("target", ""),
+                lifting_cfg_json,
+            )
+            current_data = [copy.deepcopy(lifted)]
             applied_lift = lifting_payload
         except Exception as e:
             st.error(f"Error applying lifting: {e}")
@@ -1928,6 +2672,7 @@ def _do_load_graph(cfg):
     )
     st.session_state["rank_labels"] = rank_labels_for_payload
 
+    progress("Enumerating neighborhoods")
     available = enumerate_neighborhoods(dset0)
     st.session_state["available_neighborhoods"] = available
     if not available:
@@ -1936,15 +2681,52 @@ def _do_load_graph(cfg):
         )
         return False
 
-    default_id = pick_default_neighborhood_id(available)
-    default_ids = [default_id] if default_id else []
+    available_ids = {n["id"] for n in available}
+    prev_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if prev_ids and all(pid in available_ids for pid in prev_ids):
+        default_ids = prev_ids
+    else:
+        default_id = pick_default_neighborhood_id(available)
+        default_ids = [default_id] if default_id else []
     st.session_state["selected_neighborhood_ids"] = default_ids
-    st.session_state["_loaded_max_nodes"] = int(cfg["max_nodes"])
+
+    rank_pops, num_hyperedges = _discover_rank_populations(dset0)
+    cfg_caps = cfg.get("caps_by_rank") or {}
+    caps_by_rank = {}
+    for rank, pop in rank_pops.items():
+        raw_cap = cfg_caps.get(rank, cfg_caps.get(str(rank), min(150, int(pop))))
+        cap = max(0, min(int(raw_cap), int(pop)))
+        caps_by_rank[int(rank)] = cap
+    if not caps_by_rank:
+        fallback_cap = int(cfg.get("max_nodes", 150))
+        caps_by_rank = {0: max(0, fallback_cap)}
+
+    hyperedge_cap = None
+    if num_hyperedges is not None:
+        raw_hcap = cfg.get("hyperedge_cap")
+        if raw_hcap is None:
+            raw_hcap = min(150, int(num_hyperedges))
+        hyperedge_cap = max(0, min(int(raw_hcap), int(num_hyperedges)))
+
+    st.session_state["rank_populations"] = rank_pops
+    st.session_state["hyperedge_population"] = num_hyperedges
+    st.session_state["rank_caps"] = {str(k): int(v) for k, v in caps_by_rank.items()}
+    st.session_state["_loaded_rank_caps"] = caps_by_rank
+    st.session_state["_loaded_hyperedge_cap"] = hyperedge_cap
+    progress("Computing shared sampling")
+    st.session_state["_shared_sampling"] = compute_shared_node_sampling(
+        dset0,
+        caps_by_rank=caps_by_rank,
+        cap_hyperedges=hyperedge_cap,
+    )
+
+    st.session_state["_loaded_max_nodes"] = int(caps_by_rank.get(0, cfg["max_nodes"]))
     st.session_state["_loaded_min_degree"] = int(cfg["min_degree"])
     # Sync picker widget keys to the freshly-loaded default selection
     # (also overwrites any stale values from a previous Load).
     _sync_picker_widget_state(default_ids)
 
+    progress("Building graph payload")
     return _rebuild_embed_for_neighborhoods(default_ids)
 
 
@@ -1952,6 +2734,7 @@ def _render_right_view():
     """Render the embedded D3 graph (or a placeholder) in the main area."""
     st.header("Graph")
     _render_neighborhood_picker()
+
     embed_html = st.session_state.get("_d3_embed_html")
     if not embed_html:
         st.info(
@@ -1996,6 +2779,22 @@ def _render_right_view():
     caption = st.session_state.get("_d3_caption")
     if caption:
         st.caption(caption)
+
+    shared_sampling = st.session_state.get("_shared_sampling") or {}
+    shared_by_rank = shared_sampling.get("selected_by_rank") or {}
+    rank_pops = shared_sampling.get("rank_populations") or {}
+    rank_labels = st.session_state.get("rank_labels") or {}
+    if shared_by_rank:
+        chunks = []
+        for rank in sorted(shared_by_rank.keys()):
+            sel = len(shared_by_rank.get(rank, []))
+            pop = int(rank_pops.get(rank, sel))
+            label = rank_labels.get(rank, f"Rank {rank}")
+            chunks.append(f"{label}: {sel}/{pop}")
+        sampling_mode = "shared per-rank"
+        st.caption(
+            f"Sampling snapshot ({sampling_mode}) — " + " | ".join(chunks)
+        )
 
     sel_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
     avail = st.session_state.get("available_neighborhoods") or []
@@ -2048,8 +2847,16 @@ def main():
         cfg = _render_left_config(available_datasets)
 
     if cfg["load_clicked"]:
-        with st.spinner("Loading graph…"):
-            ok = _do_load_graph(cfg)
+        with st.status("Loading graph…", expanded=True) as status:
+            def _progress(msg):
+                status.update(label=f"Loading graph… {msg}", state="running")
+                status.write(msg)
+
+            ok = _do_load_graph(cfg, progress=_progress)
+            if ok:
+                status.update(label="Graph loaded", state="complete")
+            else:
+                status.update(label="Load stopped", state="error")
         if ok:
             st.rerun()
 
