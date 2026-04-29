@@ -94,6 +94,8 @@ python -c "import torch; print(f'Torch: {torch.__version__} | CUDA: {torch.versi
 
 The interactive neighborhood explorer is a **Streamlit** app under `analysis/`. Use the **same virtual environment** you created for TopoBench (so `topobench` imports and dataset configs resolve correctly).
 
+**Dependencies:** The app loads data through TopoBench, which requires **PyTorch Geometric extension wheels** (including **`torch-sparse`**) listed in `pyproject.toml`. You must complete **Topobench setup** above—at minimum **`uv sync`** from the repository root—so those packages install into `.venv`. Installing only Streamlit into an empty environment is not enough.
+
 1. **Install Streamlit** (not included in the default dependency set):
 
    ```bash
@@ -102,7 +104,13 @@ The interactive neighborhood explorer is a **Streamlit** app under `analysis/`. 
 
    Or, with the venv activated: `pip install streamlit`.
 
-2. **Run from the repository root** (the directory that contains `configs/`, `datasets/`, `topobench/`, and `analysis/`):
+2. **Sanity check** (optional but catches missing PyG bits early):
+
+   ```bash
+   python -c "import torch_sparse; print('torch_sparse OK')"
+   ```
+
+3. **Run from the repository root** (the directory that contains `configs/`, `datasets/`, `topobench/`, and `analysis/`):
 
    ```bash
    streamlit run analysis/neighborhood_explorer_app.py
@@ -111,3 +119,18 @@ The interactive neighborhood explorer is a **Streamlit** app under `analysis/`. 
    Open the local URL Streamlit prints (typically `http://localhost:8501`).
 
 The app loads dataset YAMLs from `configs/dataset/...` and uses TopoBench loaders and transforms; keep your working directory aligned with the cloned repo layout.
+
+#### Troubleshooting: `No module named 'torch_sparse'`
+
+That module comes from the **`torch-sparse`** package. It should be pulled in by **`uv sync`**. If you still see this error:
+
+1. From the repo root, with the project venv active, run **`uv sync`** again (or re-run **`source uv_env_setup.sh cpu`** / **`cu118`** / **`cu121`** so `[tool.uv] find-links` in `pyproject.toml` matches your PyTorch build—CPU vs CUDA).
+2. If the package still does not install (sometimes happens with **manual** `uv sync` when the PyG wheel index does not match your **Torch** wheel), install the extensions explicitly for **Torch 2.3.0** and your variant—**CPU** example:
+
+   ```bash
+   uv pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.3.0+cpu.html
+   ```
+
+   For **CUDA**, use `-f https://data.pyg.org/whl/torch-2.3.0+cu118.html` or `...+cu121.html` to match your installed `torch`.
+
+On **Windows**, activate the venv with `.\.venv\Scripts\activate` instead of `source .venv/bin/activate`.
