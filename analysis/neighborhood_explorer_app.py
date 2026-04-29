@@ -218,6 +218,40 @@ def rank_color(rank):
         return "#888888"
     return DEFAULT_RANK_PALETTE[int(rank) % len(DEFAULT_RANK_PALETTE)]
 
+
+_FRIENDLY_RANK_NAMES = {0: "Nodes", 1: "Edges", 2: "Faces", 3: "Volumes"}
+
+
+def friendly_rank_label(rank, rank_labels=None) -> str:
+    """Short human-friendly cell label for a rank.
+
+    Prefers an explicit override from ``rank_labels`` (when not the generic
+    ``"Rank N"`` placeholder), then the canonical Nodes/Edges/Faces/Volumes
+    naming, then ``"k-cells"`` for higher ranks.
+    """
+    if rank is None:
+        return "Cells"
+    rk = int(rank)
+    if rank_labels:
+        custom = rank_labels.get(rk)
+        if isinstance(custom, str) and custom and custom != f"Rank {rk}":
+            return custom
+    if rk in _FRIENDLY_RANK_NAMES:
+        return _FRIENDLY_RANK_NAMES[rk]
+    return f"{rk}-cells"
+
+
+def _build_legend(ranks, rank_labels=None):
+    """Legend entries: list of ``{rank, color, label}`` for the given ranks."""
+    out = []
+    for r in sorted({int(x) for x in ranks}):
+        out.append({
+            "rank": r,
+            "color": rank_color(r),
+            "label": friendly_rank_label(r, rank_labels),
+        })
+    return out
+
 # ============================================================================
 # Data Loading Functions
 # ============================================================================
@@ -1052,7 +1086,33 @@ def networkx_to_d3_payload(
             nd["layer"] = int(layer)
         nodes_out.append(nd)
 
-    links_out = [{"source": str(u), "target": str(v)} for u, v in G.edges()]
+    inc_stroke = "#888888"
+    if graph_type == "adjacency":
+        adj_c = rank_color(src_rank)
+        links_out = [
+            {
+                "source": str(u),
+                "target": str(v),
+                "color": adj_c,
+                "kind": "adjacency",
+            }
+            for u, v in G.edges()
+        ]
+    else:
+        links_out = [
+            {
+                "source": str(u),
+                "target": str(v),
+                "color": inc_stroke,
+                "kind": "incidence",
+            }
+            for u, v in G.edges()
+        ]
+
+    if graph_type == "adjacency":
+        legend_ranks = [src_rank]
+    else:
+        legend_ranks = [src_rank, target_rank]
 
     return {
         "graphType": graph_type,
@@ -1060,6 +1120,7 @@ def networkx_to_d3_payload(
         "subtitle": subtitle,
         "nodes": nodes_out,
         "links": links_out,
+        "legend": _build_legend(legend_ranks, rank_labels),
     }
 
 
@@ -1177,7 +1238,7 @@ def build_layered_networkx(
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        G.add_edge(u, v)
+        G.add_edge(u, v, kind="incidence")
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1282,7 +1343,7 @@ def build_layered_adjacency_networkx(
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        G.add_edge(u, v)
+        G.add_edge(u, v, kind="adjacency")
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1333,7 +1394,7 @@ def build_combined_layered_networkx(
             tgt_orig = int(idx[1, i])
             u = _layered_node_id(sr, src_orig)
             v = _layered_node_id(tr, tgt_orig)
-            raw_edges.append((u, v))
+            raw_edges.append((u, v, "incidence"))
             layer_nodes.setdefault(sr, {})[u] = src_orig
             layer_nodes.setdefault(tr, {})[v] = tgt_orig
 
@@ -1356,7 +1417,7 @@ def build_combined_layered_networkx(
             seen_pairs.add(pair)
             u = _layered_node_id(rank, pair[0])
             v = _layered_node_id(rank, pair[1])
-            raw_edges.append((u, v))
+            raw_edges.append((u, v, "adjacency"))
             layer_nodes.setdefault(rank, {})[u] = pair[0]
             layer_nodes.setdefault(rank, {})[v] = pair[1]
 
@@ -1364,7 +1425,7 @@ def build_combined_layered_networkx(
         return None, {}, []
 
     degree = {}
-    for u, v in raw_edges:
+    for u, v, _ek in raw_edges:
         degree[u] = degree.get(u, 0) + 1
         degree[v] = degree.get(v, 0) + 1
 
@@ -1403,14 +1464,14 @@ def build_combined_layered_networkx(
         G.add_node(n, layer=int(rank), original_id=int(orig))
 
     seen_pairs = set()
-    for u, v in raw_edges:
+    for u, v, kind in raw_edges:
         if u not in selected or v not in selected:
             continue
         pair = (u, v) if u < v else (v, u)
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
-        G.add_edge(u, v)
+        G.add_edge(u, v, kind=kind)
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1453,7 +1514,21 @@ def networkx_to_layered_d3_payload(
             "layer": rank,
         })
 
-    links_out = [{"source": str(u), "target": str(v)} for u, v in G.edges()]
+    inc_stroke = "#888888"
+    links_out = []
+    for u, v, data in G.edges(data=True):
+        kind = data.get("kind")
+        if kind == "adjacency":
+            rk = int(G.nodes[u].get("layer", 0))
+            lc = rank_color(rk)
+        else:
+            lc = inc_stroke
+        links_out.append({
+            "source": str(u),
+            "target": str(v),
+            "color": lc,
+            "kind": kind or "incidence",
+        })
 
     return {
         "graphType": "layered",
@@ -1465,6 +1540,7 @@ def networkx_to_layered_d3_payload(
         "layerLabels": {
             str(r): rank_labels.get(r, f"Rank {r}") for r in layers_sorted
         },
+        "legend": _build_legend(layers_sorted, rank_labels),
     }
 
 
