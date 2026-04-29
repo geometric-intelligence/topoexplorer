@@ -465,20 +465,18 @@ def enumerate_neighborhoods(data):
 
     adj = edge_index_to_sparse_adj(data)
     if adj is not None and _sparse_coo_nnz(adj) > 0:
-        nnz = _sparse_coo_nnz(adj)
         out.append({
             "id": "graph",
-            "label": f"graph — edge_index adjacency ({nnz:,} nnz)",
+            "label": "graph — edge_index adjacency",
             "kind": "graph",
             "rank": None,
         })
 
     hyper = incidence_to_sparse_incidence(data)
     if hyper is not None and _sparse_coo_nnz(hyper) > 0:
-        nnz = _sparse_coo_nnz(hyper)
         out.append({
             "id": "hyperedges",
-            "label": f"incidence_hyperedges — Rank 0 → hyperedges ({nnz:,} nnz)",
+            "label": "incidence_hyperedges — Rank 0 → hyperedges",
             "kind": "hyperedges",
             "rank": None,
         })
@@ -494,7 +492,7 @@ def enumerate_neighborhoods(data):
             continue
         out.append({
             "id": f"incidence_{k}",
-            "label": f"incidence_{k} — Rank {k - 1} → Rank {k} ({nnz:,} nnz)",
+            "label": f"incidence_{k} — Rank {k - 1} → Rank {k}",
             "kind": "incidence",
             "rank": k,
         })
@@ -506,7 +504,7 @@ def enumerate_neighborhoods(data):
             continue
         out.append({
             "id": f"adjacency_{k}",
-            "label": f"adjacency_{k} — Rank {k} ↔ Rank {k} ({nnz:,} nnz)",
+            "label": f"adjacency_{k} — Rank {k} ↔ Rank {k}",
             "kind": "adjacency",
             "rank": k,
         })
@@ -2060,6 +2058,16 @@ def _render_left_config(available_datasets):
     st.session_state["max_nodes"] = int(ui_rank_caps.get(0, st.session_state.get("max_nodes", 150)))
     st.session_state["min_degree"] = min_degree
 
+    st.toggle(
+        "3D layered view (orbit/zoom)",
+        help=(
+            "Stack ranks as horizontal planes in 3D (multi-incidence, 2+ adjacency, "
+            "or combined incidence+adjacency). Single-matrix views stay 2D."
+        ),
+        key="layered_3d_view",
+        on_change=_on_layered_3d_toggle,
+    )
+
     st.subheader("Actions")
     load_clicked = st.button(
         "Load graph",
@@ -2235,6 +2243,16 @@ def _on_incidence_toggle():
     _commit_selection(new_ids)
 
 
+def _on_layered_3d_toggle():
+    """Re-embed the graph when toggling 2D vs 3D for the current selection."""
+    if st.session_state.get("data") is None:
+        return
+    ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if not ids:
+        return
+    _rebuild_embed_for_neighborhoods(ids)
+
+
 def _on_adjacency_toggle():
     """Toggling an adjacency checkbox keeps the union of checked
     incidences and adjacencies."""
@@ -2337,6 +2355,11 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         and
         len(adjacency_ids) >= 2
         and len(adjacency_ids) == len(neigh_ids)
+    )
+    is_3d_eligible = (
+        use_combined
+        or use_layered_adj
+        or (use_layered and len(incidence_ids) > 1)
     )
 
     try:
@@ -2579,11 +2602,20 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         if payload is None:
             st.error("Error building graph payload: payload is empty.")
             return False
+        if (
+            st.session_state.get("layered_3d_view")
+            and is_3d_eligible
+            and isinstance(payload, dict)
+        ):
+            payload["graphType"] = "layered3d"
+            payload["dagLevelDistance"] = 140
     except Exception as e:
         st.error(f"Error building graph payload: {e}")
         return False
 
     cache_marker = "+".join(neigh_ids)
+    if st.session_state.get("layered_3d_view"):
+        cache_marker += ":3d"
     embed_html = build_standalone_d3_html(
         payload,
         embed=True,
@@ -2598,6 +2630,12 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         f"{vdesc} — {caption_extra}" if caption_extra else vdesc
     )
     st.session_state["selected_neighborhood_ids"] = list(neigh_ids)
+    if st.session_state.get("layered_3d_view") and not is_3d_eligible:
+        st.caption(
+            "3D layered view applies to multi-rank selections only "
+            "(multi-incidence, 2+ adjacency, or combined incidence+adjacency). "
+            "Current view is 2D."
+        )
     return True
 
 
@@ -2776,26 +2814,6 @@ def _render_right_view():
                 f"Node features: {num_features if num_features else 'N/A'}"
             )
 
-    caption = st.session_state.get("_d3_caption")
-    if caption:
-        st.caption(caption)
-
-    shared_sampling = st.session_state.get("_shared_sampling") or {}
-    shared_by_rank = shared_sampling.get("selected_by_rank") or {}
-    rank_pops = shared_sampling.get("rank_populations") or {}
-    rank_labels = st.session_state.get("rank_labels") or {}
-    if shared_by_rank:
-        chunks = []
-        for rank in sorted(shared_by_rank.keys()):
-            sel = len(shared_by_rank.get(rank, []))
-            pop = int(rank_pops.get(rank, sel))
-            label = rank_labels.get(rank, f"Rank {rank}")
-            chunks.append(f"{label}: {sel}/{pop}")
-        sampling_mode = "shared per-rank"
-        st.caption(
-            f"Sampling snapshot ({sampling_mode}) — " + " | ".join(chunks)
-        )
-
     sel_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
     avail = st.session_state.get("available_neighborhoods") or []
     if sel_ids:
@@ -2831,12 +2849,6 @@ def _render_right_view():
 
 
 def main():
-    st.title("Hypergraph Neighborhood Explorer")
-    st.caption(
-        "Configure data and optional lifting in the **sidebar**, then **Load graph**. "
-        "Use **Available neighborhoods** on this page to switch connectivity views."
-    )
-
     flash = st.session_state.pop("_flash_ok", None)
     if flash:
         st.success(flash)

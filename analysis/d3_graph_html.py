@@ -32,7 +32,7 @@ def build_standalone_d3_html(
 
     Payload keys
     ------------
-    graphType : 'adjacency' | 'bipartite'
+    graphType : 'adjacency' | 'bipartite' | 'layered' | 'layered3d'
     title, subtitle : str
     nodes : list of dicts with id, label, degree, color, layer (0|1 for bipartite),
             optional stroke (CSS color for ring highlight)
@@ -61,6 +61,13 @@ def build_standalone_d3_html(
             f"  <!-- cache_marker: {html_module.escape(str(cache_marker), quote=True)} -->\n"
         )
 
+    use_3d = payload.get("graphType") == "layered3d"
+    force_graph_3d_script = (
+        '  <script src="https://cdn.jsdelivr.net/npm/3d-force-graph"></script>\n'
+        if use_3d
+        else ""
+    )
+
     # Split HTML: f-string cannot embed arbitrary JSON (``{`` / ``}`` in payload).
     _head = f"""<!DOCTYPE html>
 <html lang="en">
@@ -69,7 +76,7 @@ def build_standalone_d3_html(
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{title_esc}</title>
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
-  <style>
+{force_graph_3d_script}  <style>
     * {{ box-sizing: border-box; }}
     {body_extra}
     body {{ font-family: system-ui, Segoe UI, sans-serif; margin: 0; background: #f0f0f0; }}
@@ -102,10 +109,6 @@ def build_standalone_d3_html(
       document.getElementById("err").textContent = msg;
     }
     try {
-      if (typeof d3 === "undefined") {
-        showError("D3 failed to load from CDN. Connect to the internet or open this file in Edge/Chrome.");
-        return;
-      }
       const raw = document.getElementById("graph-payload").textContent;
       const payload = JSON.parse(raw);
       document.getElementById("hdr-title").textContent = payload.title || "Graph";
@@ -118,6 +121,65 @@ def build_standalone_d3_html(
       });
       if (nodes.length === 0) {
         showError("No nodes in graph payload.");
+        return;
+      }
+
+      if (payload.graphType === "layered3d") {
+        if (typeof ForceGraph3D === "undefined") {
+          showError("3d-force-graph failed to load from CDN. Connect to the internet or use a recent browser.");
+          return;
+        }
+        const chart = document.getElementById("chart");
+        const width = Math.max(420, chart.clientWidth || window.innerWidth || 800);
+        const height = Math.max(420, chart.clientHeight || (window.innerHeight - 100) || 600);
+        const layersSorted = (payload.layers || []).slice().sort(function(a, b) { return a - b; });
+        const levelDist = (payload.dagLevelDistance !== undefined) ? Number(payload.dagLevelDistance) : 140;
+        const center = (layersSorted.length - 1) / 2;
+        const yByRank = {};
+        layersSorted.forEach(function(rank, i) {
+          yByRank[String(rank)] = (i - center) * levelDist;
+        });
+        const nodes3d = nodes.map(function(n) {
+          const rank = (n.layer === undefined ? 0 : n.layer);
+          const y = yByRank[String(rank)];
+          return Object.assign({}, n, {
+            fy: (y === undefined ? 0 : y)
+          });
+        });
+        const links3d = (payload.links || []).map(function(l) {
+          return { source: String(l.source), target: String(l.target) };
+        });
+        const graph3d = ForceGraph3D()(chart)
+          .width(width)
+          .height(height)
+          .backgroundColor("#fafafa")
+          .nodeRelSize(4)
+          .nodeColor(function(n) { return n.color || "#666"; })
+          .nodeLabel(function(n) { return (n.label || n.id) + " — degree " + (n.degree || 0); })
+          .nodeVal(function(n) { return 1 + Math.log1p(n.degree || 1); })
+          .linkColor(function() { return "#888"; })
+          .linkOpacity(0.6)
+          .linkWidth(0.6)
+          .graphData({ nodes: nodes3d, links: links3d });
+        var chargeForce = graph3d.d3Force("charge");
+        if (chargeForce) chargeForce.strength(-40);
+        var linkForce = graph3d.d3Force("link");
+        if (linkForce) linkForce.distance(40).strength(0.7);
+
+        (function() {
+          var ro = new ResizeObserver(function() {
+            if (!chart) return;
+            var w = Math.max(320, chart.clientWidth || 800);
+            var h = Math.max(320, chart.clientHeight || 600);
+            graph3d.width(w).height(h);
+          });
+          ro.observe(chart);
+        })();
+        return;
+      }
+
+      if (typeof d3 === "undefined") {
+        showError("D3 failed to load from CDN. Connect to the internet or open this file in Edge/Chrome.");
         return;
       }
 
