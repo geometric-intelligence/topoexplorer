@@ -118,6 +118,33 @@ def load_dataset_config(domain, dataset_name):
     
     return config_dict
 
+
+def _format_num_features(num_features):
+    """Format num_features for display (scalar or list)."""
+    if num_features is None:
+        return "N/A"
+    if isinstance(num_features, (list, tuple)):
+        return ", ".join(str(x) for x in num_features)
+    return str(num_features)
+
+
+def extract_dataset_metadata(domain, dataset_name):
+    """Read descriptive dataset fields from YAML (no loader invocation)."""
+    try:
+        dataset_yaml = load_dataset_config(domain, dataset_name)
+    except (FileNotFoundError, yaml.YAMLError, OSError):
+        return {}
+    params = dataset_yaml.get("parameters") or {}
+    split_params = dataset_yaml.get("split_params") or {}
+    return {
+        "task": params.get("task"),
+        "task_level": params.get("task_level"),
+        "learning_setting": split_params.get("learning_setting"),
+        "num_features": params.get("num_features"),
+        "num_classes": params.get("num_classes"),
+        "split_type": split_params.get("split_type"),
+    }
+
 # ============================================================================
 # Configuration and Constants
 # ============================================================================
@@ -1655,7 +1682,7 @@ def _ensure_float_node_features(data):
     return d
 
 
-def apply_lifting(data, lifting_info):
+def apply_lifting(data, lifting_info, *, graph_index=0):
     """
     Instantiate and apply a TopoBench lifting transform to a data object.
 
@@ -1689,7 +1716,7 @@ def apply_lifting(data, lifting_info):
 
     # Extract a single graph object if the dataset is an iterable collection
     if hasattr(data, '__getitem__'):
-        single = data[0]
+        single = data[graph_index]
     else:
         single = data
 
@@ -1714,8 +1741,9 @@ def _apply_lifting_cached(
     lifting_source,
     lifting_target,
     lifting_config_json,
+    graph_index=0,
 ):
-    """Cache lifted data by dataset + lifting identity + config."""
+    """Cache lifted data by dataset + lifting identity + config + graph index."""
     raw, _ = _load_dataset_cached(domain=domain, dataset_name=dataset_name)
     raw_copy = copy.deepcopy(raw)
     payload = {
@@ -1724,7 +1752,7 @@ def _apply_lifting_cached(
         "target": lifting_target,
         "config": json.loads(lifting_config_json),
     }
-    return apply_lifting(raw_copy, payload)
+    return apply_lifting(raw_copy, payload, graph_index=graph_index)
 
 
 BASIC_EDITABLE_KEYS = {
@@ -1947,6 +1975,28 @@ def render_basic_lifting_editor(selected_lifting):
 D3_EMBED_HEIGHT = 760
 
 
+def _render_dataset_metadata_card(domain, dataset_name):
+    """Read-only dataset metadata from configs/dataset YAML."""
+    meta = extract_dataset_metadata(domain, dataset_name)
+    st.markdown("**Dataset metadata**")
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.caption(f"**task:** {meta.get('task') or 'N/A'}")
+        st.caption(f"**task_level:** {meta.get('task_level') or 'N/A'}")
+        st.caption(
+            f"**num_features:** {_format_num_features(meta.get('num_features'))}"
+        )
+    with col_right:
+        st.caption(
+            f"**learning_setting:** {meta.get('learning_setting') or 'N/A'}"
+        )
+        st.caption(f"**split_type:** {meta.get('split_type') or 'N/A'}")
+        num_classes = meta.get("num_classes")
+        st.caption(
+            f"**num_classes:** {num_classes if num_classes is not None else 'N/A'}"
+        )
+
+
 def _render_left_config(available_datasets):
     """Render configuration controls in the Streamlit sidebar; return selections."""
     st.header("Data configuration")
@@ -1966,6 +2016,16 @@ def _render_left_config(available_datasets):
             help=f"YAML stem under configs/dataset/{selected_domain}/",
         )
         st.caption(f"**{selected_domain}** / **{selected_dataset}**")
+        _render_dataset_metadata_card(selected_domain, selected_dataset)
+
+        prev_key = st.session_state.get("_last_dataset_key")
+        dataset_key = (selected_domain, selected_dataset)
+        if prev_key != dataset_key:
+            st.session_state["active_graph_index"] = 0
+            st.session_state["loaded_dataset_size"] = 0
+            st.session_state["_last_dataset_key"] = dataset_key
+            if "main_graph_index_input" in st.session_state:
+                del st.session_state["main_graph_index_input"]
 
     use_lifting = st.toggle(
         "Use lifting",
@@ -2026,114 +2086,6 @@ def _render_left_config(available_datasets):
     st.session_state["edited_lifting_config"] = edited_lifting_config
     st.session_state["edited_lifting_errors"] = edited_lifting_errors
 
-    st.subheader("Graph sampling")
-    loaded_data = st.session_state.get("data")
-    dset0 = loaded_data[0] if (loaded_data is not None and hasattr(loaded_data, "__getitem__")) else loaded_data
-    rank_populations = {}
-    hyperedge_population = None
-    if dset0 is not None:
-        rank_populations, hyperedge_population = _discover_rank_populations(dset0)
-
-    ui_rank_caps = {}
-    ui_hyperedge_cap = None
-    if rank_populations:
-        max_rank_pop = max(rank_populations.values()) if rank_populations else 0
-        with st.expander("Per-rank node caps", expanded=True):
-            st.caption(
-                "Set how many nodes to keep per rank on the next **Load graph**."
-            )
-
-            if int(max_rank_pop) >= 2:
-                all_cap_default = int(
-                    st.session_state.get("ui_set_all_rank_caps", 150)
-                )
-                all_cap = st.number_input(
-                    "Set all ranks to",
-                    min_value=0,
-                    max_value=int(max_rank_pop),
-                    value=max(0, min(all_cap_default, int(max_rank_pop))),
-                    step=1,
-                    key="ui_set_all_rank_caps",
-                )
-                if st.button(
-                    "Apply to all rank caps",
-                    use_container_width=True,
-                    key="ui_apply_all_rank_caps",
-                ):
-                    for rank, pop in rank_populations.items():
-                        if int(pop) >= 2:
-                            st.session_state[f"ui_rank_cap_{rank}"] = max(
-                                0, min(int(all_cap), int(pop))
-                            )
-                    st.rerun()
-
-            rank_labels = st.session_state.get("rank_labels") or {}
-            for rank, pop in sorted(rank_populations.items()):
-                pop_int = int(pop)
-                label_prefix = rank_labels.get(rank, f"Rank {rank}")
-                if pop_int <= 1:
-                    ui_rank_caps[int(rank)] = pop_int
-                    st.caption(
-                        f"{label_prefix}: {pop_int} node(s) — slider hidden."
-                    )
-                    continue
-
-                key = f"ui_rank_cap_{rank}"
-                default_cap = min(150, pop_int)
-                value_cap = int(st.session_state.get(key, default_cap))
-                ui_rank_caps[int(rank)] = st.slider(
-                    f"{label_prefix} cap",
-                    min_value=0,
-                    max_value=pop_int,
-                    value=max(0, min(value_cap, pop_int)),
-                    key=key,
-                )
-
-            if hyperedge_population is not None:
-                hyper_pop_int = int(hyperedge_population)
-                if hyper_pop_int <= 1:
-                    ui_hyperedge_cap = hyper_pop_int
-                    st.caption(
-                        f"Hyperedges: {hyper_pop_int} — slider hidden."
-                    )
-                else:
-                    hyper_default = min(150, hyper_pop_int)
-                    hyper_value = int(
-                        st.session_state.get("ui_hyperedge_cap", hyper_default)
-                    )
-                    ui_hyperedge_cap = st.slider(
-                        "Hyperedge cap",
-                        min_value=0,
-                        max_value=hyper_pop_int,
-                        value=max(0, min(hyper_value, hyper_pop_int)),
-                        key="ui_hyperedge_cap",
-                    )
-    else:
-        max_nodes = st.slider(
-            "Max nodes in graph (fallback before first load)",
-            min_value=50,
-            max_value=500,
-            value=st.session_state.get("max_nodes", 150),
-            help=(
-                "Before loading data we don't know available ranks yet. "
-                "After loading, this becomes per-rank sliders."
-            ),
-            key="ui_max_nodes",
-        )
-        ui_rank_caps = {0: int(max_nodes)}
-        ui_hyperedge_cap = None
-
-    min_degree = st.slider(
-        "Minimum degree",
-        min_value=0,
-        max_value=20,
-        value=st.session_state.get("min_degree", 0),
-        key="ui_min_degree",
-    )
-    st.session_state["rank_caps"] = {str(k): int(v) for k, v in ui_rank_caps.items()}
-    st.session_state["max_nodes"] = int(ui_rank_caps.get(0, st.session_state.get("max_nodes", 150)))
-    st.session_state["min_degree"] = min_degree
-
     st.toggle(
         "3D layered view (orbit/zoom)",
         help=(
@@ -2159,10 +2111,6 @@ def _render_left_config(available_datasets):
         "selected_lifting": selected_lifting,
         "edited_lifting_config": edited_lifting_config,
         "edited_lifting_errors": edited_lifting_errors,
-        "caps_by_rank": ui_rank_caps,
-        "hyperedge_cap": ui_hyperedge_cap,
-        "max_nodes": int(ui_rank_caps.get(0, st.session_state.get("max_nodes", 150))),
-        "min_degree": min_degree,
         "load_clicked": load_clicked,
     }
 
@@ -2715,6 +2663,541 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     return True
 
 
+def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name):
+    """Populate neighborhoods, sampling, and embed for a working sample."""
+    rank_labels_for_payload = get_rank_labels(
+        loaded_domain, dataset_name, dset0
+    )
+    st.session_state["rank_labels"] = rank_labels_for_payload
+
+    available = enumerate_neighborhoods(dset0)
+    st.session_state["available_neighborhoods"] = available
+    if not available:
+        st.error(
+            "No incidence/adjacency neighborhoods are available on this data."
+        )
+        return False
+
+    available_ids = {n["id"] for n in available}
+    prev_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if prev_ids and all(pid in available_ids for pid in prev_ids):
+        default_ids = prev_ids
+    else:
+        default_id = pick_default_neighborhood_id(available)
+        default_ids = [default_id] if default_id else []
+    st.session_state["selected_neighborhood_ids"] = default_ids
+
+    rank_pops, num_hyperedges = _discover_rank_populations(dset0)
+    cfg_caps = cfg.get("caps_by_rank") or {}
+    caps_by_rank = {}
+    for rank, pop in rank_pops.items():
+        pop_int = int(pop)
+        if rank in cfg_caps or str(rank) in cfg_caps:
+            raw_cap = cfg_caps.get(rank, cfg_caps.get(str(rank)))
+        else:
+            raw_cap = _default_cap_for_population(pop_int)
+        cap = max(0, min(int(raw_cap), pop_int))
+        caps_by_rank[int(rank)] = cap
+    if not caps_by_rank:
+        fallback_cap = _default_cap_for_population(
+            int(cfg.get("max_nodes", DEFAULT_LARGE_CAP))
+        )
+        caps_by_rank = {0: fallback_cap}
+
+    hyperedge_cap = cfg.get("hyperedge_cap")
+    if num_hyperedges is not None and hyperedge_cap is None:
+        hyperedge_cap = _default_cap_for_population(int(num_hyperedges))
+    if hyperedge_cap is not None and num_hyperedges is not None:
+        hyperedge_cap = max(0, min(int(hyperedge_cap), int(num_hyperedges)))
+
+    min_degree = int(cfg.get("min_degree", 0))
+    for rank, cap in caps_by_rank.items():
+        st.session_state[f"ui_rank_cap_{rank}"] = int(cap)
+    if (
+        hyperedge_cap is not None
+        and num_hyperedges is not None
+        and int(num_hyperedges) > 1
+    ):
+        st.session_state["ui_hyperedge_cap"] = int(hyperedge_cap)
+    st.session_state["ui_min_degree"] = min_degree
+
+    st.session_state["rank_populations"] = rank_pops
+    st.session_state["hyperedge_population"] = num_hyperedges
+    st.session_state["rank_caps"] = {str(k): int(v) for k, v in caps_by_rank.items()}
+    st.session_state["_loaded_rank_caps"] = caps_by_rank
+    st.session_state["_loaded_hyperedge_cap"] = hyperedge_cap
+    st.session_state["_shared_sampling"] = compute_shared_node_sampling(
+        dset0,
+        caps_by_rank=caps_by_rank,
+        cap_hyperedges=hyperedge_cap,
+    )
+
+    st.session_state["_loaded_max_nodes"] = int(
+        caps_by_rank.get(0, cfg.get("max_nodes", DEFAULT_LARGE_CAP))
+    )
+    st.session_state["_loaded_min_degree"] = min_degree
+    _sync_picker_widget_state(default_ids)
+    return _rebuild_embed_for_neighborhoods(default_ids)
+
+
+def _build_sample_at_index(raw, graph_index, cfg):
+    """Return (current_data, applied_lift) for one graph index."""
+    applied_lift = None
+    if cfg["use_lifting"] and cfg["selected_lifting"] is not None:
+        lifting_payload = copy.deepcopy(cfg["selected_lifting"])
+        if isinstance(cfg.get("edited_lifting_config"), dict):
+            lifting_payload["config"] = copy.deepcopy(cfg["edited_lifting_config"])
+        lifting_cfg_json = json.dumps(
+            lifting_payload.get("config") or {},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        lifted = _apply_lifting_cached(
+            cfg["selected_domain"],
+            cfg["selected_dataset"],
+            lifting_payload.get("name", ""),
+            lifting_payload.get("source", ""),
+            lifting_payload.get("target", ""),
+            lifting_cfg_json,
+            graph_index=graph_index,
+        )
+        return [copy.deepcopy(lifted)], lifting_payload
+    if hasattr(raw, "__getitem__"):
+        return [copy.deepcopy(raw[graph_index])], None
+    return raw, None
+
+
+def _reload_graph_at_index(graph_index):
+    """Reload visualization for a different inductive graph sample."""
+    raw = st.session_state.get("data_original")
+    if raw is None:
+        st.error("Cannot switch graph sample: no dataset loaded.")
+        return False
+
+    total = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+    max_idx = max(0, total - 1)
+    idx = int(graph_index)
+    if idx < 0 or idx > max_idx:
+        st.error(f"Graph index must be between 0 and {max_idx}.")
+        return False
+
+    cfg = st.session_state.get("_load_cfg_snapshot") or {}
+    try:
+        current_data, applied_lift = _build_sample_at_index(raw, idx, cfg)
+    except Exception as e:
+        st.error(f"Error loading graph sample {idx}: {e}")
+        return False
+
+    st.session_state["data"] = current_data
+    st.session_state["lifting_applied"] = applied_lift
+    dset0 = (
+        current_data[0] if hasattr(current_data, "__getitem__") else current_data
+    )
+
+    finalize_cfg = {
+        "caps_by_rank": st.session_state.get("_loaded_rank_caps") or {},
+        "hyperedge_cap": st.session_state.get("_loaded_hyperedge_cap"),
+        "max_nodes": st.session_state.get("_loaded_max_nodes", DEFAULT_LARGE_CAP),
+        "min_degree": st.session_state.get("_loaded_min_degree", 0),
+    }
+    loaded_domain = st.session_state.get("data_domain")
+    dataset_name = st.session_state.get("dataset_name")
+    ok = _finalize_loaded_sample(dset0, finalize_cfg, loaded_domain, dataset_name)
+    if ok:
+        st.session_state["active_graph_index"] = idx
+    return ok
+
+
+DEFAULT_LARGE_CAP = 150
+
+
+def _default_cap_for_population(pop):
+    pop = int(pop)
+    return pop if pop <= DEFAULT_LARGE_CAP else DEFAULT_LARGE_CAP
+
+
+def _auto_caps_by_rank(rank_populations):
+    return {
+        int(r): _default_cap_for_population(p) for r, p in rank_populations.items()
+    }
+
+
+def _default_load_sampling_cfg():
+    return {
+        "caps_by_rank": {},
+        "hyperedge_cap": None,
+        "max_nodes": DEFAULT_LARGE_CAP,
+        "min_degree": 0,
+    }
+
+
+def _get_sampling_context():
+    """Return dset0, rank_populations, hyperedge_population, is_loaded."""
+    loaded_data = st.session_state.get("data")
+    if loaded_data is not None and hasattr(loaded_data, "__getitem__"):
+        dset0 = loaded_data[0]
+    else:
+        dset0 = loaded_data
+    is_loaded = dset0 is not None
+    rank_populations = {}
+    hyperedge_population = None
+    if dset0 is not None:
+        rank_populations, hyperedge_population = _discover_rank_populations(dset0)
+    return dset0, rank_populations, hyperedge_population, is_loaded
+
+
+def _format_rank_cap_summary(rank_populations, hyperedge_population):
+    """One-line summary of current cap settings for the popover trigger."""
+    rank_labels = st.session_state.get("rank_labels") or {}
+    parts = []
+    for rank, pop in sorted(rank_populations.items()):
+        pop_int = int(pop)
+        label = rank_labels.get(rank, f"Rank {rank}")
+        if pop_int <= 1:
+            parts.append(f"{label}: {pop_int}")
+        else:
+            key = f"ui_rank_cap_{rank}"
+            cap = int(
+                st.session_state.get(
+                    key, _default_cap_for_population(pop_int)
+                )
+            )
+            parts.append(f"{label}: {cap}/{pop_int}")
+    if hyperedge_population is not None:
+        hyper_pop_int = int(hyperedge_population)
+        if hyper_pop_int <= 1:
+            parts.append(f"Hyperedges: {hyper_pop_int}")
+        else:
+            cap = int(
+                st.session_state.get(
+                    "ui_hyperedge_cap", _default_cap_for_population(hyper_pop_int)
+                )
+            )
+            parts.append(f"Hyperedges: {cap}/{hyper_pop_int}")
+    return " · ".join(parts) if parts else "No ranks discovered"
+
+
+def _render_rank_cap_sliders(rank_populations, hyperedge_population):
+    """Render per-rank and hyperedge cap sliders inside popover or inline."""
+    ui_rank_caps = {}
+    ui_hyperedge_cap = None
+    if not rank_populations:
+        return ui_rank_caps, ui_hyperedge_cap
+
+    max_rank_pop = max(rank_populations.values()) if rank_populations else 0
+    if int(max_rank_pop) >= 2:
+        set_col, btn_col = st.columns([3, 2])
+        with set_col:
+            all_cap_default = int(
+                st.session_state.get("ui_set_all_rank_caps", DEFAULT_LARGE_CAP)
+            )
+            all_cap = st.number_input(
+                "Set all ranks to",
+                min_value=0,
+                max_value=int(max_rank_pop),
+                value=max(0, min(all_cap_default, int(max_rank_pop))),
+                step=1,
+                key="ui_set_all_rank_caps",
+            )
+        with btn_col:
+            st.write("")
+            if st.button(
+                "Apply to all",
+                use_container_width=True,
+                key="ui_apply_all_rank_caps",
+            ):
+                for rank, pop in rank_populations.items():
+                    if int(pop) >= 2:
+                        st.session_state[f"ui_rank_cap_{rank}"] = max(
+                            0, min(int(all_cap), int(pop))
+                        )
+                _on_sampling_control_change()
+
+    rank_labels = st.session_state.get("rank_labels") or {}
+    for rank, pop in sorted(rank_populations.items()):
+        pop_int = int(pop)
+        label_prefix = rank_labels.get(rank, f"Rank {rank}")
+        if pop_int <= 1:
+            ui_rank_caps[int(rank)] = pop_int
+            st.caption(f"{label_prefix}: {pop_int} node(s) — fixed.")
+            continue
+
+        key = f"ui_rank_cap_{rank}"
+        default_cap = _default_cap_for_population(pop_int)
+        value_cap = int(st.session_state.get(key, default_cap))
+        ui_rank_caps[int(rank)] = st.slider(
+            f"{label_prefix} cap",
+            min_value=0,
+            max_value=pop_int,
+            value=max(0, min(value_cap, pop_int)),
+            key=key,
+            on_change=_on_sampling_control_change,
+        )
+
+    if hyperedge_population is not None:
+        hyper_pop_int = int(hyperedge_population)
+        if hyper_pop_int <= 1:
+            ui_hyperedge_cap = hyper_pop_int
+            st.caption(f"Hyperedges: {hyper_pop_int} — fixed.")
+        else:
+            hyper_default = _default_cap_for_population(hyper_pop_int)
+            hyper_value = int(
+                st.session_state.get("ui_hyperedge_cap", hyper_default)
+            )
+            ui_hyperedge_cap = st.slider(
+                "Hyperedge cap",
+                min_value=0,
+                max_value=hyper_pop_int,
+                value=max(0, min(hyper_value, hyper_pop_int)),
+                key="ui_hyperedge_cap",
+                on_change=_on_sampling_control_change,
+            )
+    return ui_rank_caps, ui_hyperedge_cap
+
+
+def _render_inline_rank_cap(rank_populations, hyperedge_population):
+    """Single-rank (or one configurable rank) inline cap slider."""
+    ui_rank_caps = {}
+    ui_hyperedge_cap = None
+    rank_labels = st.session_state.get("rank_labels") or {}
+    for rank, pop in sorted(rank_populations.items()):
+        pop_int = int(pop)
+        if pop_int <= 1:
+            ui_rank_caps[int(rank)] = pop_int
+            continue
+        label_prefix = rank_labels.get(rank, f"Rank {rank}")
+        key = f"ui_rank_cap_{rank}"
+        default_cap = _default_cap_for_population(pop_int)
+        value_cap = int(st.session_state.get(key, default_cap))
+        ui_rank_caps[int(rank)] = st.slider(
+            f"{label_prefix} cap",
+            min_value=0,
+            max_value=pop_int,
+            value=max(0, min(value_cap, pop_int)),
+            key=key,
+            on_change=_on_sampling_control_change,
+        )
+    if hyperedge_population is not None:
+        hyper_pop_int = int(hyperedge_population)
+        if hyper_pop_int <= 1:
+            ui_hyperedge_cap = hyper_pop_int
+        else:
+            hyper_default = _default_cap_for_population(hyper_pop_int)
+            hyper_value = int(
+                st.session_state.get("ui_hyperedge_cap", hyper_default)
+            )
+            ui_hyperedge_cap = st.slider(
+                "Hyperedge cap",
+                min_value=0,
+                max_value=hyper_pop_int,
+                value=max(0, min(hyper_value, hyper_pop_int)),
+                key="ui_hyperedge_cap",
+                on_change=_on_sampling_control_change,
+            )
+    return ui_rank_caps, ui_hyperedge_cap
+
+
+def _render_rank_cap_controls(rank_populations, hyperedge_population):
+    """Render rank-cap UI (inline or popover); return (ui_rank_caps, ui_hyperedge_cap)."""
+    if not rank_populations:
+        return {}, None
+
+    configurable = [
+        rank for rank, pop in rank_populations.items() if int(pop) >= 2
+    ]
+    use_popover = len(configurable) >= 2
+
+    if use_popover:
+        summary = _format_rank_cap_summary(rank_populations, hyperedge_population)
+        st.caption(summary)
+        with st.popover("Per-rank caps", use_container_width=True):
+            return _render_rank_cap_sliders(rank_populations, hyperedge_population)
+
+    return _render_inline_rank_cap(rank_populations, hyperedge_population)
+
+
+def _collect_sampling_cfg(ui_rank_caps, ui_hyperedge_cap, min_degree):
+    """Build sampling fields for load / apply from widget values."""
+    st.session_state["rank_caps"] = {str(k): int(v) for k, v in ui_rank_caps.items()}
+    max_nodes = int(
+        ui_rank_caps.get(0, st.session_state.get("max_nodes", DEFAULT_LARGE_CAP))
+    )
+    st.session_state["max_nodes"] = max_nodes
+    st.session_state["min_degree"] = int(min_degree)
+    return {
+        "caps_by_rank": ui_rank_caps,
+        "hyperedge_cap": ui_hyperedge_cap,
+        "max_nodes": max_nodes,
+        "min_degree": int(min_degree),
+    }
+
+
+def _read_sampling_cfg_from_session():
+    """Read cap/min-degree settings from widget session keys."""
+    rank_pops = st.session_state.get("rank_populations") or {}
+    ui_rank_caps = {}
+    for rank, pop in rank_pops.items():
+        pop_int = int(pop)
+        if pop_int <= 1:
+            ui_rank_caps[int(rank)] = pop_int
+        else:
+            key = f"ui_rank_cap_{rank}"
+            default = _default_cap_for_population(pop_int)
+            ui_rank_caps[int(rank)] = int(st.session_state.get(key, default))
+
+    hyperedge_population = st.session_state.get("hyperedge_population")
+    ui_hyperedge_cap = None
+    if hyperedge_population is not None:
+        hyper_pop_int = int(hyperedge_population)
+        if hyper_pop_int <= 1:
+            ui_hyperedge_cap = hyper_pop_int
+        else:
+            ui_hyperedge_cap = int(
+                st.session_state.get(
+                    "ui_hyperedge_cap",
+                    _default_cap_for_population(hyper_pop_int),
+                )
+            )
+
+    min_degree = int(st.session_state.get("ui_min_degree", 0))
+    return _collect_sampling_cfg(ui_rank_caps, ui_hyperedge_cap, min_degree)
+
+
+def _on_sampling_control_change():
+    """Rebuild embed when a sampling slider changes (post-load live update)."""
+    data = st.session_state.get("data")
+    if data is None:
+        return
+
+    cfg = _read_sampling_cfg_from_session()
+    loaded_caps = st.session_state.get("_loaded_rank_caps") or {}
+    loaded_hyper = st.session_state.get("_loaded_hyperedge_cap")
+    loaded_min = int(st.session_state.get("_loaded_min_degree", 0))
+    if (
+        cfg["caps_by_rank"] == loaded_caps
+        and cfg.get("hyperedge_cap") == loaded_hyper
+        and cfg["min_degree"] == loaded_min
+    ):
+        return
+
+    dset0 = data[0] if hasattr(data, "__getitem__") else data
+    loaded_domain = st.session_state.get("data_domain")
+    dataset_name = st.session_state.get("dataset_name")
+    ok = _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name)
+    if ok:
+        snap = st.session_state.get("_load_cfg_snapshot") or {}
+        snap["caps_by_rank"] = copy.deepcopy(cfg.get("caps_by_rank") or {})
+        snap["hyperedge_cap"] = cfg.get("hyperedge_cap")
+        snap["max_nodes"] = cfg.get("max_nodes", DEFAULT_LARGE_CAP)
+        snap["min_degree"] = cfg.get("min_degree", 0)
+        st.session_state["_load_cfg_snapshot"] = snap
+        st.rerun()
+
+
+def _on_main_graph_index_change():
+    """Reload when the user submits a graph index from the main-panel input."""
+    active = int(st.session_state.get("active_graph_index", 0))
+    raw_val = str(st.session_state.get("main_graph_index_input", "0")).strip()
+    total = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+    max_idx = max(0, total - 1)
+
+    try:
+        idx = int(raw_val)
+    except ValueError:
+        st.session_state["main_graph_index_input"] = str(active)
+        st.session_state["_graph_index_error"] = "Enter an integer."
+        return
+
+    if idx < 0 or idx > max_idx:
+        st.session_state["main_graph_index_input"] = str(active)
+        st.session_state["_graph_index_error"] = (
+            f"Enter an integer between 0 and {max_idx}."
+        )
+        return
+
+    if idx == active:
+        st.session_state.pop("_graph_index_error", None)
+        return
+
+    if _reload_graph_at_index(idx):
+        st.session_state["main_graph_index_input"] = str(idx)
+        st.session_state.pop("_graph_index_error", None)
+        st.rerun()
+
+
+def _render_graph_index_input(active, error=None):
+    """Graph index text input with compact inline validation styling."""
+    if "main_graph_index_input" not in st.session_state:
+        st.session_state["main_graph_index_input"] = str(active)
+
+    with st.container(key="graph_index_input_block"):
+        if error:
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stTextInput"]:has(input[aria-label="Graph index"]) input {
+                    border-color: #ff4b4b !important;
+                    box-shadow: 0 0 0 1px #ff4b4b !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.text_input(
+            "Graph index",
+            key="main_graph_index_input",
+            on_change=_on_main_graph_index_change,
+        )
+        if error:
+            st.markdown(
+                f'<p style="color:#ff4b4b;font-size:0.8rem;margin:-0.4rem 0 0.25rem 0;">'
+                f"{error}</p>",
+                unsafe_allow_html=True,
+            )
+
+
+def _render_graph_sample_section():
+    """Post-load graph sample index and live sampling controls."""
+    if st.session_state.get("data") is None:
+        return
+
+    st.subheader("Graph sample")
+
+    _dset0, rank_populations, hyperedge_population, _is_loaded = (
+        _get_sampling_context()
+    )
+    meta = st.session_state.get("dataset_metadata") or {}
+    is_inductive = (meta.get("learning_setting") or "").lower() == "inductive"
+
+    with st.container(border=True):
+        col_left, col_right = st.columns([0.4, 0.6], gap="large")
+
+        with col_left:
+            if is_inductive:
+                total = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+                max_idx = max(0, total - 1)
+                active = int(st.session_state.get("active_graph_index", 0))
+                err = st.session_state.get("_graph_index_error")
+                _render_graph_index_input(active, error=err)
+                st.caption(
+                    f"**Available graphs:** `0` to `{max_idx}` ({total} total)"
+                )
+            else:
+                st.caption("Single graph (transductive dataset)")
+
+            st.slider(
+                "Minimum degree",
+                min_value=0,
+                max_value=20,
+                value=int(st.session_state.get("ui_min_degree", 0)),
+                key="ui_min_degree",
+                on_change=_on_sampling_control_change,
+            )
+
+        with col_right:
+            _render_rank_cap_controls(rank_populations, hyperedge_population)
+
+
 def _do_load_graph(cfg, progress=None):
     """Build dataset, optional lifting, and embed-ready D3 HTML.
 
@@ -2741,6 +3224,15 @@ def _do_load_graph(cfg, progress=None):
     except Exception:
         st.session_state["data_original"] = raw
 
+    total = len(raw) if hasattr(raw, "__len__") else 1
+    st.session_state["loaded_dataset_size"] = total
+    graph_index = 0
+
+    st.session_state["dataset_metadata"] = extract_dataset_metadata(
+        cfg["selected_domain"], cfg["selected_dataset"]
+    )
+    st.session_state["_load_cfg_snapshot"] = copy.deepcopy(cfg)
+
     current_data = raw
     applied_lift = None
     if cfg["use_lifting"] and cfg["selected_lifting"] is not None:
@@ -2750,109 +3242,43 @@ def _do_load_graph(cfg, progress=None):
                 + "\n- ".join(cfg["edited_lifting_errors"])
             )
             return False
-        lifting_payload = copy.deepcopy(cfg["selected_lifting"])
-        if isinstance(cfg["edited_lifting_config"], dict):
-            lifting_payload["config"] = copy.deepcopy(cfg["edited_lifting_config"])
         progress("Applying lifting transform")
         try:
-            lifting_cfg_json = json.dumps(
-                lifting_payload.get("config") or {},
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            lifted = _apply_lifting_cached(
-                cfg["selected_domain"],
-                cfg["selected_dataset"],
-                lifting_payload.get("name", ""),
-                lifting_payload.get("source", ""),
-                lifting_payload.get("target", ""),
-                lifting_cfg_json,
-            )
-            current_data = [copy.deepcopy(lifted)]
-            applied_lift = lifting_payload
+            current_data, applied_lift = _build_sample_at_index(raw, graph_index, cfg)
         except Exception as e:
             st.error(f"Error applying lifting: {e}")
             return False
+    elif hasattr(raw, "__getitem__"):
+        current_data = [copy.deepcopy(raw[graph_index])]
 
     st.session_state["data"] = current_data
     st.session_state["lifting_applied"] = applied_lift
     st.session_state["data_domain"] = loaded_domain
     st.session_state["dataset_name"] = cfg["selected_dataset"]
+    st.session_state["active_graph_index"] = 0
+    st.session_state["main_graph_index_input"] = "0"
+
     dset0 = (
         current_data[0] if hasattr(current_data, "__getitem__") else current_data
     )
-    rank_labels_for_payload = get_rank_labels(
-        loaded_domain, cfg["selected_dataset"], dset0
-    )
-    st.session_state["rank_labels"] = rank_labels_for_payload
 
     progress("Enumerating neighborhoods")
-    available = enumerate_neighborhoods(dset0)
-    st.session_state["available_neighborhoods"] = available
-    if not available:
-        st.error(
-            "No incidence/adjacency neighborhoods are available on this data."
-        )
-        return False
-
-    available_ids = {n["id"] for n in available}
-    prev_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
-    if prev_ids and all(pid in available_ids for pid in prev_ids):
-        default_ids = prev_ids
-    else:
-        default_id = pick_default_neighborhood_id(available)
-        default_ids = [default_id] if default_id else []
-    st.session_state["selected_neighborhood_ids"] = default_ids
-
-    rank_pops, num_hyperedges = _discover_rank_populations(dset0)
-    cfg_caps = cfg.get("caps_by_rank") or {}
-    caps_by_rank = {}
-    for rank, pop in rank_pops.items():
-        raw_cap = cfg_caps.get(rank, cfg_caps.get(str(rank), min(150, int(pop))))
-        cap = max(0, min(int(raw_cap), int(pop)))
-        caps_by_rank[int(rank)] = cap
-    if not caps_by_rank:
-        fallback_cap = int(cfg.get("max_nodes", 150))
-        caps_by_rank = {0: max(0, fallback_cap)}
-
-    hyperedge_cap = None
-    if num_hyperedges is not None:
-        raw_hcap = cfg.get("hyperedge_cap")
-        if raw_hcap is None:
-            raw_hcap = min(150, int(num_hyperedges))
-        hyperedge_cap = max(0, min(int(raw_hcap), int(num_hyperedges)))
-
-    st.session_state["rank_populations"] = rank_pops
-    st.session_state["hyperedge_population"] = num_hyperedges
-    st.session_state["rank_caps"] = {str(k): int(v) for k, v in caps_by_rank.items()}
-    st.session_state["_loaded_rank_caps"] = caps_by_rank
-    st.session_state["_loaded_hyperedge_cap"] = hyperedge_cap
     progress("Computing shared sampling")
-    st.session_state["_shared_sampling"] = compute_shared_node_sampling(
-        dset0,
-        caps_by_rank=caps_by_rank,
-        cap_hyperedges=hyperedge_cap,
+    progress("Building graph payload")
+    return _finalize_loaded_sample(
+        dset0, cfg, loaded_domain, cfg["selected_dataset"]
     )
 
-    st.session_state["_loaded_max_nodes"] = int(caps_by_rank.get(0, cfg["max_nodes"]))
-    st.session_state["_loaded_min_degree"] = int(cfg["min_degree"])
-    # Sync picker widget keys to the freshly-loaded default selection
-    # (also overwrites any stale values from a previous Load).
-    _sync_picker_widget_state(default_ids)
 
-    progress("Building graph payload")
-    return _rebuild_embed_for_neighborhoods(default_ids)
-
-
-def _render_right_view():
-    """Render the embedded D3 graph (or a placeholder) in the main area."""
-    st.header("Graph")
+def _render_graph_view_rest():
+    """Neighborhood picker and D3 embed (after graph sample section)."""
     _render_neighborhood_picker()
 
     embed_html = st.session_state.get("_d3_embed_html")
     if not embed_html:
         st.info(
-            "Use the **sidebar** to configure the dataset, then click **Load graph**."
+            "Use the **sidebar** to choose dataset and lifting options, then click "
+            "**Load graph**."
         )
         return
 
@@ -2932,15 +3358,18 @@ def main():
     available_datasets = discover_available_datasets()
 
     with st.sidebar:
-        cfg = _render_left_config(available_datasets)
+        sidebar_cfg = _render_left_config(available_datasets)
 
-    if cfg["load_clicked"]:
+    st.header("Graph")
+
+    if sidebar_cfg["load_clicked"]:
+        load_cfg = {**sidebar_cfg, **_default_load_sampling_cfg()}
         with st.status("Loading graph…", expanded=True) as status:
             def _progress(msg):
                 status.update(label=f"Loading graph… {msg}", state="running")
                 status.write(msg)
 
-            ok = _do_load_graph(cfg, progress=_progress)
+            ok = _do_load_graph(load_cfg, progress=_progress)
             if ok:
                 status.update(label="Graph loaded", state="complete")
             else:
@@ -2948,7 +3377,10 @@ def main():
         if ok:
             st.rerun()
 
-    _render_right_view()
+    if st.session_state.get("data") is not None:
+        _render_graph_sample_section()
+
+    _render_graph_view_rest()
 
 
 if __name__ == "__main__":
