@@ -21,9 +21,7 @@ import webbrowser
 from pathlib import Path
 import yaml
 
-# Add parent directory to path for imports
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _REPO_ROOT)
+# Add analysis directory to path for local module imports (e.g. d3_graph_html)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
