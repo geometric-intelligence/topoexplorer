@@ -9,6 +9,8 @@ Run with: streamlit run analysis/neighborhood_explorer_app.py
 import sys
 import os
 import copy
+import inspect
+import importlib.util
 import json
 import re
 import math
@@ -39,6 +41,11 @@ import configs as _topobench_configs
 # package in site-packages, e.g. <site-packages>/configs/).
 _CONFIGS_ROOT = Path(_topobench_configs.__file__).parent
 
+# Root of the practitioner-owned extension directory inside this repo.
+_CUSTOM_ROOT = Path(__file__).parent.parent / "custom"
+_CUSTOM_CONFIGS_ROOT = _CUSTOM_ROOT / "configs"
+_CUSTOM_LOADERS_DIR = _CUSTOM_ROOT / "loaders"
+
 # When topobench is installed as a package (not cloned locally), rootutils
 # cannot find the .project-root marker starting from the pip install location.
 # Patch setup_root (the function run.py calls directly) to fall back to the
@@ -62,90 +69,155 @@ rootutils.setup_root = _setup_root_with_fallback
 # ============================================================================
 
 @st.cache_resource
+def _load_custom_loaders() -> dict:
+    """Dynamically import all loader classes from custom/loaders/*.py.
+
+    Any class whose name ends in ``DatasetLoader`` defined in a file under
+    ``custom/loaders/`` is collected and returned in a name → class mapping.
+    Files that fail to import (e.g. due to missing optional dependencies) are
+    silently skipped.
+    """
+    loaders = {}
+    if not _CUSTOM_LOADERS_DIR.exists():
+        return loaders
+    for file_path in sorted(_CUSTOM_LOADERS_DIR.glob("*.py")):
+        spec = importlib.util.spec_from_file_location(file_path.stem, file_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                continue
+            for name, obj in inspect.getmembers(module, inspect.isclass):
+                if "DatasetLoader" in name and obj.__module__ == module.__name__:
+                    loaders[name] = obj
+    return loaders
+
+
+@st.cache_resource
 def discover_available_datasets():
-    """Scan configs/dataset folder and discover all available datasets."""
+    """Scan configs/dataset folders and discover all available datasets.
+
+    Merges datasets from the installed topobench ``configs`` package and from
+    ``custom/configs/dataset/``. Custom domains are suffixed with
+    ``" (custom)"`` in the returned dict so they are visually distinct in the
+    UI.  If a custom domain name matches a built-in one the datasets are merged
+    into the same key (without the suffix) to allow config overrides.
+    """
     datasets_by_domain = {}
+
+    # --- built-in topobench datasets ---
     config_dir = _CONFIGS_ROOT / "dataset"
-    
-    if not config_dir.exists():
-        return datasets_by_domain
-    
-    # Scan each domain folder
-    for domain_folder in config_dir.iterdir():
-        if not domain_folder.is_dir():
-            continue
-        
-        domain_name = domain_folder.name
-        datasets_by_domain[domain_name] = []
-        
-        # Scan all yaml files in the domain folder
-        for yaml_file in domain_folder.glob("*.yaml"):
-            dataset_name = yaml_file.stem
-            if dataset_name != "manual_dataset":  # Skip special files
-                datasets_by_domain[domain_name].append(dataset_name)
-        
-        # Sort dataset names
-        datasets_by_domain[domain_name].sort()
-    
+    if config_dir.exists():
+        for domain_folder in config_dir.iterdir():
+            if not domain_folder.is_dir():
+                continue
+            domain_name = domain_folder.name
+            datasets_by_domain.setdefault(domain_name, [])
+            for yaml_file in domain_folder.glob("*.yaml"):
+                dataset_name = yaml_file.stem
+                if dataset_name != "manual_dataset":
+                    datasets_by_domain[domain_name].append(dataset_name)
+            datasets_by_domain[domain_name].sort()
+
+    # --- custom datasets ---
+    custom_config_dir = _CUSTOM_CONFIGS_ROOT / "dataset"
+    if custom_config_dir.exists():
+        for domain_folder in custom_config_dir.iterdir():
+            if not domain_folder.is_dir():
+                continue
+            domain_name = domain_folder.name
+            yaml_files = [
+                f for f in domain_folder.glob("*.yaml")
+                if f.stem != "manual_dataset"
+            ]
+            if not yaml_files:
+                continue
+            # Use a "(custom)" suffix only when the domain is not already present
+            # as a built-in domain, so purely-custom domains are clearly labelled.
+            display_name = domain_name if domain_name in datasets_by_domain \
+                else f"{domain_name} (custom)"
+            datasets_by_domain.setdefault(display_name, [])
+            for yaml_file in yaml_files:
+                datasets_by_domain[display_name].append(yaml_file.stem)
+            datasets_by_domain[display_name].sort()
+
     return datasets_by_domain
+
 
 @st.cache_resource
 def discover_available_liftings():
-    """Scan configs/transforms/liftings folder and discover all available liftings, grouped by source domain."""
+    """Scan liftings config folders and discover all available liftings.
+
+    Merges liftings from the installed topobench ``configs`` package and from
+    ``custom/configs/transforms/liftings/``.  Custom liftings whose
+    ``transform_name`` would clash with a built-in one are distinguished by a
+    ``" (custom)"`` suffix.
+    """
     liftings_by_source = {}
-    liftings_dir = _CONFIGS_ROOT / "transforms" / "liftings"
 
-    if not liftings_dir.exists():
-        return liftings_by_source
+    def _scan_liftings_dir(liftings_dir: Path, custom: bool = False):
+        if not liftings_dir.exists():
+            return
+        for subfolder in sorted(liftings_dir.iterdir()):
+            if not subfolder.is_dir():
+                continue
+            folder_name = subfolder.name  # e.g. "graph2hypergraph"
+            parts = folder_name.split("2")
+            if len(parts) != 2:
+                continue
+            source_domain, target_domain = parts[0], parts[1]
+            liftings_by_source.setdefault(source_domain, [])
+            existing_names = {e['name'] for e in liftings_by_source[source_domain]}
+            for yaml_file in sorted(subfolder.glob("*.yaml")):
+                with open(yaml_file, 'r') as f:
+                    config = yaml.safe_load(f)
+                transform_name = config.get('transform_name', yaml_file.stem)
+                if custom and transform_name in existing_names:
+                    transform_name = f"{transform_name} (custom)"
+                liftings_by_source[source_domain].append({
+                    'name': transform_name,
+                    'file': yaml_file.stem,
+                    'source': source_domain,
+                    'target': target_domain,
+                    'config_path': str(yaml_file),
+                    'config': config,
+                })
 
-    for subfolder in sorted(liftings_dir.iterdir()):
-        if not subfolder.is_dir():
-            continue
-
-        folder_name = subfolder.name  # e.g. "graph2hypergraph"
-        parts = folder_name.split("2")
-        if len(parts) != 2:
-            continue
-
-        source_domain, target_domain = parts[0], parts[1]
-
-        if source_domain not in liftings_by_source:
-            liftings_by_source[source_domain] = []
-
-        for yaml_file in sorted(subfolder.glob("*.yaml")):
-            with open(yaml_file, 'r') as f:
-                config = yaml.safe_load(f)
-            transform_name = config.get('transform_name', yaml_file.stem)
-            liftings_by_source[source_domain].append({
-                'name': transform_name,
-                'file': yaml_file.stem,
-                'source': source_domain,
-                'target': target_domain,
-                'config_path': str(yaml_file),
-                'config': config,
-            })
+    _scan_liftings_dir(_CONFIGS_ROOT / "transforms" / "liftings", custom=False)
+    _scan_liftings_dir(_CUSTOM_CONFIGS_ROOT / "transforms" / "liftings", custom=True)
 
     return liftings_by_source
 
 
 def load_dataset_config(domain, dataset_name):
-    """Load the yaml config for a specific dataset and resolve interpolations."""
-    config_path = _CONFIGS_ROOT / "dataset" / domain / f"{dataset_name}.yaml"
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Dataset config not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        config_dict = yaml.safe_load(f)
-    
-    return config_dict
+    """Load the yaml config for a specific dataset and resolve interpolations.
+
+    Custom configs (``custom/configs/dataset/``) take priority over the
+    built-in topobench configs so practitioners can override a built-in
+    dataset by placing a same-named YAML in the custom directory.
+    """
+    # Strip the " (custom)" display suffix if present
+    bare_domain = domain.removesuffix(" (custom)")
+
+    # Check custom configs first
+    for root in (_CUSTOM_CONFIGS_ROOT, _CONFIGS_ROOT):
+        config_path = root / "dataset" / bare_domain / f"{dataset_name}.yaml"
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+
+    raise FileNotFoundError(
+        f"Dataset config not found for '{domain}/{dataset_name}' "
+        f"in topobench configs or custom/configs/."
+    )
 
 # ============================================================================
 # Configuration and Constants
 # ============================================================================
 
 st.set_page_config(
-    page_title="Hypergraph Neighborhood Explorer",
+    page_title="Topological Neighborhood Explorer",
     page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -245,20 +317,18 @@ def rank_color(rank):
 # ============================================================================
 
 def load_dataset(domain, dataset_name):
-    """Load a dataset by properly resolving config interpolations."""
-    # Load the yaml config
-    config_path = _CONFIGS_ROOT / "dataset" / domain / f"{dataset_name}.yaml"
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Dataset config not found: {config_path}")
-    
-    # Load raw YAML
-    with open(config_path, 'r') as f:
-        dataset_yaml = yaml.safe_load(f)
-    
+    """Load a dataset by properly resolving config interpolations.
+
+    Loader resolution order:
+    1. Built-in topobench loaders (``topobench.data.loaders``)
+    2. Custom loaders discovered from ``custom/loaders/*.py``
+    """
+    # Load the yaml config (custom configs take priority over built-in ones)
+    dataset_yaml = load_dataset_config(domain, dataset_name)
+
     # Get project root
     project_root = Path(__file__).parent.parent
-    
+
     # Create base config with paths that can be interpolated
     base_config = {
         'paths': {
@@ -267,34 +337,42 @@ def load_dataset(domain, dataset_name):
             'log_dir': str(project_root / 'logs'),
         }
     }
-    
+
     # Create OmegaConf and merge - this allows interpolation resolution
     cfg = OmegaConf.create(base_config)
     dataset_cfg = OmegaConf.create({'dataset': dataset_yaml})
     cfg = OmegaConf.merge(cfg, dataset_cfg)
-    
+
     # Resolve all interpolations
     cfg_resolved = OmegaConf.to_container(cfg, resolve=True)
     resolved_dataset = cfg_resolved['dataset']
-    
+
     # Get the loader class name from _target_
     loader_target = resolved_dataset['loader'].get('_target_')
     if not loader_target:
         raise ValueError("No loader target found in config")
-    
+
     class_name = loader_target.split('.')[-1]
-    
-    # Import the loader class
+
+    # Resolve loader class: built-in topobench loaders first, then custom
     from topobench.data import loaders as loaders_module
-    loader_class = getattr(loaders_module, class_name)
-    
+    loader_class = getattr(loaders_module, class_name, None)
+    if loader_class is None:
+        custom_loaders = _load_custom_loaders()
+        loader_class = custom_loaders.get(class_name)
+    if loader_class is None:
+        raise ValueError(
+            f"Loader '{class_name}' not found in topobench built-in loaders "
+            f"or in custom/loaders/. Check the _target_ field in your dataset YAML."
+        )
+
     # Create OmegaConf config from resolved loader parameters
     loader_params = OmegaConf.create(resolved_dataset['loader']['parameters'])
-    
+
     # Instantiate loader and load data
     loader = loader_class(loader_params)
     data, dataset_dir = loader.load()
-    
+
     return data, domain
 
 
