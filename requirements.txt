@@ -4,3 +4,4 @@
 # Pin the CPU build explicitly so pip does not pull a CUDA wheel from PyPI
 torch==2.3.0+cpu
 topobench @ git+https://github.com/geometric-intelligence/topobench.git
+streamlit

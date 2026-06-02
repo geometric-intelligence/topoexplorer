@@ -1,7 +1,0 @@
-topobench.nn.wrappers.hypergraph.hypergraph\_wrapper module
-===========================================================
-
-.. automodule:: topobench.nn.wrappers.hypergraph.hypergraph_wrapper
-   :members:
-   :undoc-members:
-   :show-inheritance:

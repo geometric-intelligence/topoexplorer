@@ -1,7 +1,0 @@
-topobench.transforms.data\_manipulations.laplacian\_encodings module
-====================================================================
-
-.. automodule:: topobench.transforms.data_manipulations.laplacian_encodings
-   :members:
-   :undoc-members:
-   :show-inheritance:

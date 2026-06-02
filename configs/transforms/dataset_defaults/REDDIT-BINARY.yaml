@@ -1,3 +1,0 @@
-defaults:
-  - data_manipulations@equal_gaus_features: equal_gaus_features
-  - liftings@_here_: ${get_required_lifting:graph,${model}}

@@ -32,6 +32,30 @@ import torch
 from d3_graph_html import build_standalone_d3_html
 from omegaconf import OmegaConf
 from torch_geometric.utils import to_undirected
+import rootutils
+import configs as _topobench_configs
+
+# Root of the installed topobench configs package (sibling of the topobench
+# package in site-packages, e.g. <site-packages>/configs/).
+_CONFIGS_ROOT = Path(_topobench_configs.__file__).parent
+
+# When topobench is installed as a package (not cloned locally), rootutils
+# cannot find the .project-root marker starting from the pip install location.
+# Patch setup_root (the function run.py calls directly) to fall back to the
+# topoexplorer repo root, which has the marker file.
+_TOPOEXPLORER_ROOT = Path(__file__).parent.parent
+_orig_setup_root = rootutils.setup_root
+
+def _setup_root_with_fallback(search_from, indicator=".project-root", **kwargs):
+    try:
+        return _orig_setup_root(search_from, indicator, **kwargs)
+    except FileNotFoundError:
+        os.environ.setdefault("PROJECT_ROOT", str(_TOPOEXPLORER_ROOT))
+        if kwargs.get("pythonpath", False):
+            sys.path.insert(0, str(_TOPOEXPLORER_ROOT))
+        return _TOPOEXPLORER_ROOT
+
+rootutils.setup_root = _setup_root_with_fallback
 
 # ============================================================================
 # Dataset Discovery Functions
@@ -41,7 +65,7 @@ from torch_geometric.utils import to_undirected
 def discover_available_datasets():
     """Scan configs/dataset folder and discover all available datasets."""
     datasets_by_domain = {}
-    config_dir = Path(__file__).parent.parent / "configs" / "dataset"
+    config_dir = _CONFIGS_ROOT / "dataset"
     
     if not config_dir.exists():
         return datasets_by_domain
@@ -69,7 +93,7 @@ def discover_available_datasets():
 def discover_available_liftings():
     """Scan configs/transforms/liftings folder and discover all available liftings, grouped by source domain."""
     liftings_by_source = {}
-    liftings_dir = Path(__file__).parent.parent / "configs" / "transforms" / "liftings"
+    liftings_dir = _CONFIGS_ROOT / "transforms" / "liftings"
 
     if not liftings_dir.exists():
         return liftings_by_source
@@ -106,7 +130,7 @@ def discover_available_liftings():
 
 def load_dataset_config(domain, dataset_name):
     """Load the yaml config for a specific dataset and resolve interpolations."""
-    config_path = Path(__file__).parent.parent / "configs" / "dataset" / domain / f"{dataset_name}.yaml"
+    config_path = _CONFIGS_ROOT / "dataset" / domain / f"{dataset_name}.yaml"
     
     if not config_path.exists():
         raise FileNotFoundError(f"Dataset config not found: {config_path}")
@@ -223,7 +247,7 @@ def rank_color(rank):
 def load_dataset(domain, dataset_name):
     """Load a dataset by properly resolving config interpolations."""
     # Load the yaml config
-    config_path = Path(__file__).parent.parent / "configs" / "dataset" / domain / f"{dataset_name}.yaml"
+    config_path = _CONFIGS_ROOT / "dataset" / domain / f"{dataset_name}.yaml"
     
     if not config_path.exists():
         raise FileNotFoundError(f"Dataset config not found: {config_path}")
