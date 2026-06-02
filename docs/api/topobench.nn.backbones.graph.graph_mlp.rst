@@ -1,7 +1,0 @@
-topobench.nn.backbones.graph.graph\_mlp module
-==============================================
-
-.. automodule:: topobench.nn.backbones.graph.graph_mlp
-   :members:
-   :undoc-members:
-   :show-inheritance:
