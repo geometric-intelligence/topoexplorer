@@ -305,57 +305,71 @@ def _build_legend(ranks, rank_labels=None):
 # Data Loading Functions
 # ============================================================================
 
+def _strip_unresolvable_interpolations(d):
+    """Recursively replace unresolvable ${...} strings with None in a dict."""
+    if isinstance(d, dict):
+        return {k: _strip_unresolvable_interpolations(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_strip_unresolvable_interpolations(v) for v in d]
+    if isinstance(d, str) and d.strip().startswith('${'):
+        return None
+    return d
+
+
 def load_dataset(domain, dataset_name):
     """Load a dataset by properly resolving config interpolations."""
-    # Load the yaml config
     config_path = _CONFIGS_ROOT / "dataset" / domain / f"{dataset_name}.yaml"
-    
+
     if not config_path.exists():
         raise FileNotFoundError(f"Dataset config not found: {config_path}")
-    
-    # Load raw YAML
+
     with open(config_path, 'r') as f:
         dataset_yaml = yaml.safe_load(f)
-    
-    # Get project root
+
     project_root = Path(__file__).parent.parent
-    
-    # Create base config with paths that can be interpolated
+
     base_config = {
         'paths': {
             'root_dir': str(project_root),
             'data_dir': str(project_root / 'datasets'),
             'log_dir': str(project_root / 'logs'),
-        }
+        },
+        'model': {'model_name': '', 'backbone': {'neighborhoods': None}},
     }
-    
-    # Create OmegaConf and merge - this allows interpolation resolution
+
     cfg = OmegaConf.create(base_config)
     dataset_cfg = OmegaConf.create({'dataset': dataset_yaml})
     cfg = OmegaConf.merge(cfg, dataset_cfg)
-    
-    # Resolve all interpolations
-    cfg_resolved = OmegaConf.to_container(cfg, resolve=True)
+
+    try:
+        cfg_resolved = OmegaConf.to_container(cfg, resolve=True)
+    except Exception:
+        loader_cfg = OmegaConf.create({
+            'paths': base_config['paths'],
+            'dataset': {'loader': dataset_yaml.get('loader', {})},
+        })
+        loader_resolved = OmegaConf.to_container(loader_cfg, resolve=True)
+        full_unresolved = OmegaConf.to_container(cfg, resolve=False)
+        full_unresolved = _strip_unresolvable_interpolations(full_unresolved)
+        cfg_resolved = full_unresolved
+        cfg_resolved['dataset']['loader'] = loader_resolved['dataset']['loader']
+
     resolved_dataset = cfg_resolved['dataset']
-    
-    # Get the loader class name from _target_
+
     loader_target = resolved_dataset['loader'].get('_target_')
     if not loader_target:
         raise ValueError("No loader target found in config")
-    
+
     class_name = loader_target.split('.')[-1]
-    
-    # Import the loader class
+
     from topobench.data import loaders as loaders_module
     loader_class = getattr(loaders_module, class_name)
-    
-    # Create OmegaConf config from resolved loader parameters
+
     loader_params = OmegaConf.create(resolved_dataset['loader']['parameters'])
-    
-    # Instantiate loader and load data
+
     loader = loader_class(loader_params)
     data, dataset_dir = loader.load()
-    
+
     return data, domain
 
 
@@ -1704,7 +1718,57 @@ def _ensure_float_node_features(data):
     return d
 
 
-def apply_lifting(data, lifting_info, *, graph_index=0):
+def _resolve_oc_select(value, dataset_params):
+    """Resolve a ${oc.select:key,default} interpolation against dataset parameters.
+
+    Returns the resolved value, or None if unresolvable and no default exists.
+    """
+    m = re.match(r"^\$\{oc\.select:([^,}]+)(?:,([^}]*))?\}$", value.strip())
+    if not m:
+        return None
+    key_path = m.group(1).strip()
+    default_str = m.group(2)
+
+    parts = key_path.split(".")
+    if parts[:2] == ["dataset", "parameters"] and len(parts) == 3:
+        param_name = parts[2]
+        if param_name in dataset_params:
+            return dataset_params[param_name]
+
+    if default_str is not None:
+        default_str = default_str.strip()
+        if default_str.lower() == "null" or default_str.lower() == "none":
+            return None
+        if default_str.lower() == "true":
+            return True
+        if default_str.lower() == "false":
+            return False
+        try:
+            return int(default_str)
+        except ValueError:
+            pass
+        try:
+            return float(default_str)
+        except ValueError:
+            pass
+        return default_str
+    return None
+
+
+def _get_dataset_parameters_for_lifting(lifting_info, domain=None, dataset_name=None):
+    """Load dataset parameters to use when resolving lifting config interpolations."""
+    source_domain = domain or lifting_info.get("source", "graph")
+    dset_name = dataset_name or st.session_state.get("dataset_name")
+    if not dset_name:
+        return {}
+    try:
+        cfg = load_dataset_config(source_domain, dset_name)
+        return cfg.get("parameters") or {}
+    except (FileNotFoundError, Exception):
+        return {}
+
+
+def apply_lifting(data, lifting_info, *, graph_index=0, domain=None, dataset_name=None):
     """
     Instantiate and apply a TopoBench lifting transform to a data object.
 
@@ -1721,22 +1785,25 @@ def apply_lifting(data, lifting_info, *, graph_index=0):
     transform_name = lifting_info['name']
     config = lifting_info['config']
 
-    # Keys that are not constructor parameters or need special handling
     SKIP_KEYS = {'transform_type', 'transform_name'}
+
+    dataset_params = _get_dataset_parameters_for_lifting(
+        lifting_info, domain=domain, dataset_name=dataset_name
+    )
 
     params = {}
     for k, v in config.items():
         if k in SKIP_KEYS:
             continue
-        # Drop unresolved Hydra interpolation strings (e.g. "${oc.select:...}")
         if isinstance(v, str) and v.startswith('${'):
+            resolved = _resolve_oc_select(v, dataset_params)
+            if resolved is not None:
+                params[k] = resolved
             continue
         params[k] = v
 
-    # DataTransform takes transform_name as first positional arg + **kwargs
     transform = DataTransform(transform_name=transform_name, **params)
 
-    # Extract a single graph object if the dataset is an iterable collection
     if hasattr(data, '__getitem__'):
         single = data[graph_index]
     else:
@@ -1744,7 +1811,6 @@ def apply_lifting(data, lifting_info, *, graph_index=0):
 
     single = _ensure_float_node_features(single)
 
-    # PyG BaseTransform.__call__ -> forward(data) -> transformed Data
     transformed = transform(single)
     return transformed
 
@@ -1774,7 +1840,10 @@ def _apply_lifting_cached(
         "target": lifting_target,
         "config": json.loads(lifting_config_json),
     }
-    return apply_lifting(raw_copy, payload, graph_index=graph_index)
+    return apply_lifting(
+        raw_copy, payload, graph_index=graph_index,
+        domain=domain, dataset_name=dataset_name,
+    )
 
 
 BASIC_EDITABLE_KEYS = {
