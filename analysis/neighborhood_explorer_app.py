@@ -156,8 +156,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ~2× Streamlit’s default sidebar width (~256px in recent releases).
-_SIDEBAR_TARGET_WIDTH_PX = 512
+# Fixed, slightly-wider sidebar. The native collapse arrow is kept as a
+# "focus mode" so the user can momentarily hide controls for a full-width graph.
+_SIDEBAR_TARGET_WIDTH_PX = 560
 st.markdown(
     f"""
     <style>
@@ -165,6 +166,42 @@ st.markdown(
         min-width: {_SIDEBAR_TARGET_WIDTH_PX}px;
         max-width: {_SIDEBAR_TARGET_WIDTH_PX}px;
         width: {_SIDEBAR_TARGET_WIDTH_PX}px;
+    }}
+    /* Main canvas: light margins; graph block height set by components.html only. */
+    [data-testid="stMainBlockContainer"], .block-container {{
+        padding-top: 0.5rem;
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+        max-width: 100%;
+    }}
+    [data-testid="stSidebar"] {{
+        position: relative;
+    }}
+    [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {{
+        position: absolute;
+        top: 0.5rem;
+        left: 0.35rem;
+        z-index: 10;
+        background: transparent;
+    }}
+    .topo-sidebar-title {{
+        text-align: center;
+        margin: 0.5rem 2.25rem 0.5rem 2.25rem;
+        font-size: 1.35rem;
+        font-weight: 700;
+    }}
+    [data-testid="stSidebarHeader"] {{
+        min-height: 0;
+        padding: 0;
+        border: none;
+    }}
+    [data-testid="stSidebarUserContent"] {{ padding-top: 0.25rem; }}
+    /* Large, full-width sidebar tab buttons only. */
+    [data-testid="stSidebar"] .st-key-tab_load_btn button,
+    [data-testid="stSidebar"] .st-key-tab_explore_btn button {{
+        height: 3.2rem;
+        font-size: 1.05rem;
+        font-weight: 600;
     }}
     </style>
     """,
@@ -1618,26 +1655,6 @@ def launch_html_in_browser(path: Path) -> bool:
     return False
 
 
-def open_d3_graph_window(payload):
-    """Write standalone HTML to a temp file and open in browser."""
-    if payload is None:
-        st.warning("No graph to display.")
-        return
-    sel_ids = st.session_state.get("selected_neighborhood_ids") or []
-    marker = "+".join(sel_ids) if sel_ids else None
-    html_doc = build_standalone_d3_html(payload, cache_marker=marker)
-    st.session_state["_d3_last_html"] = html_doc
-    path = Path(tempfile.gettempdir()) / f"topobench_graph_{uuid.uuid4().hex}.html"
-    path.write_text(html_doc, encoding="utf-8")
-    if launch_html_in_browser(path):
-        st.success("Opened graph in your browser.")
-    else:
-        st.warning(
-            "Could not launch a browser automatically. Use **Download last D3 graph** "
-            "below and open the file in Edge or Chrome (not VS Code preview)."
-        )
-
-
 # ============================================================================
 # Lifting Application
 # ============================================================================
@@ -1972,7 +1989,26 @@ def render_basic_lifting_editor(selected_lifting):
 # Streamlit App
 # ============================================================================
 
-D3_EMBED_HEIGHT = 760
+# Graph block height for ``components.html`` (header + chart inside the iframe).
+D3_EMBED_HEIGHT = 820
+
+
+def _format_graph_header_title(vdesc, dataset_name, lift_line, num_nodes) -> str:
+    """Single-line title for the D3 embed header (View, Dataset, Lift, Nodes)."""
+    nodes_str = str(num_nodes) if num_nodes is not None else "N/A"
+    return (
+        f"View: {vdesc}  Dataset: {dataset_name}  |  {lift_line}  |  Nodes: {nodes_str}"
+    )
+
+
+def _node_count_from_dataset(dset0):
+    """Return node count for header display, or None if unavailable."""
+    if dset0 is None or not hasattr(dset0, "num_nodes"):
+        return None
+    num_nodes = dset0.num_nodes
+    if num_nodes is None and getattr(dset0, "edge_index", None) is not None:
+        num_nodes = int(dset0.edge_index.max().item()) + 1
+    return num_nodes
 
 
 def _render_dataset_metadata_card(domain, dataset_name):
@@ -2085,16 +2121,6 @@ def _render_left_config(available_datasets):
     st.session_state["selected_lifting"] = selected_lifting
     st.session_state["edited_lifting_config"] = edited_lifting_config
     st.session_state["edited_lifting_errors"] = edited_lifting_errors
-
-    st.toggle(
-        "3D layered view (orbit/zoom)",
-        help=(
-            "Stack ranks as horizontal planes in 3D (multi-incidence, 2+ adjacency, "
-            "or combined incidence+adjacency). Single-matrix views stay 2D."
-        ),
-        key="layered_3d_view",
-        on_change=_on_layered_3d_toggle,
-    )
 
     st.subheader("Actions")
     load_clicked = st.button(
@@ -2640,6 +2666,14 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     cache_marker = "+".join(neigh_ids)
     if st.session_state.get("layered_3d_view"):
         cache_marker += ":3d"
+
+    dataset_name = st.session_state.get("dataset_name") or "—"
+    num_nodes = _node_count_from_dataset(dset0)
+    payload["title"] = _format_graph_header_title(
+        vdesc, dataset_name, lift_subtitle, num_nodes
+    )
+    payload["subtitle"] = ""
+
     embed_html = build_standalone_d3_html(
         payload,
         embed=True,
@@ -2998,19 +3032,17 @@ def _render_inline_rank_cap(rank_populations, hyperedge_population):
 
 
 def _render_rank_cap_controls(rank_populations, hyperedge_population):
-    """Render rank-cap UI (inline or popover); return (ui_rank_caps, ui_hyperedge_cap)."""
+    """Render rank-cap UI (inline or expander); return (ui_rank_caps, ui_hyperedge_cap)."""
     if not rank_populations:
         return {}, None
 
     configurable = [
         rank for rank, pop in rank_populations.items() if int(pop) >= 2
     ]
-    use_popover = len(configurable) >= 2
+    use_expander = len(configurable) >= 2
 
-    if use_popover:
-        summary = _format_rank_cap_summary(rank_populations, hyperedge_population)
-        st.caption(summary)
-        with st.popover("Per-rank caps", use_container_width=True):
+    if use_expander:
+        with st.expander("Per-rank caps", expanded=True):
             return _render_rank_cap_sliders(rank_populations, hyperedge_population)
 
     return _render_inline_rank_cap(rank_populations, hyperedge_population)
@@ -3161,41 +3193,38 @@ def _render_graph_sample_section():
     if st.session_state.get("data") is None:
         return
 
-    st.subheader("Graph sample")
-
     _dset0, rank_populations, hyperedge_population, _is_loaded = (
         _get_sampling_context()
     )
     meta = st.session_state.get("dataset_metadata") or {}
     is_inductive = (meta.get("learning_setting") or "").lower() == "inductive"
 
-    with st.container(border=True):
-        col_left, col_right = st.columns([0.4, 0.6], gap="large")
+    if is_inductive:
+        total = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+        max_idx = max(0, total - 1)
+        active = int(st.session_state.get("active_graph_index", 0))
+        err = st.session_state.get("_graph_index_error")
+        _render_graph_index_input(active, error=err)
+        st.caption(
+            f"**Available graphs:** `0` to `{max_idx}` ({total} total)"
+        )
+    else:
+        st.caption("Single graph (transductive dataset)")
 
-        with col_left:
-            if is_inductive:
-                total = int(st.session_state.get("loaded_dataset_size", 1) or 1)
-                max_idx = max(0, total - 1)
-                active = int(st.session_state.get("active_graph_index", 0))
-                err = st.session_state.get("_graph_index_error")
-                _render_graph_index_input(active, error=err)
-                st.caption(
-                    f"**Available graphs:** `0` to `{max_idx}` ({total} total)"
-                )
-            else:
-                st.caption("Single graph (transductive dataset)")
+    st.slider(
+        "Minimum degree",
+        min_value=0,
+        max_value=20,
+        value=int(st.session_state.get("ui_min_degree", 0)),
+        key="ui_min_degree",
+        help="Drop nodes below this degree after rank caps are applied.",
+        on_change=_on_sampling_control_change,
+    )
 
-            st.slider(
-                "Minimum degree",
-                min_value=0,
-                max_value=20,
-                value=int(st.session_state.get("ui_min_degree", 0)),
-                key="ui_min_degree",
-                on_change=_on_sampling_control_change,
-            )
-
-        with col_right:
-            _render_rank_cap_controls(rank_populations, hyperedge_population)
+    if rank_populations:
+        summary = _format_rank_cap_summary(rank_populations, hyperedge_population)
+        st.caption(summary)
+        _render_rank_cap_controls(rank_populations, hyperedge_population)
 
 
 def _do_load_graph(cfg, progress=None):
@@ -3270,78 +3299,84 @@ def _do_load_graph(cfg, progress=None):
     )
 
 
-def _render_graph_view_rest():
-    """Neighborhood picker and D3 embed (after graph sample section)."""
-    _render_neighborhood_picker()
+def _render_sidebar_tab_selector(data_loaded):
+    """Large two-tab selector backed by session state (survives reruns)."""
+    options = ["Load graph", "Explore"]
 
-    embed_html = st.session_state.get("_d3_embed_html")
-    if not embed_html:
-        st.info(
-            "Use the **sidebar** to choose dataset and lifting options, then click "
-            "**Load graph**."
-        )
+    # Apply a programmatic switch requested on a previous run (e.g. after a
+    # successful load). Must happen BEFORE the tab buttons are rendered.
+    pending = st.session_state.pop("_pending_tab", None)
+    if pending in options:
+        st.session_state["active_sidebar_tab"] = pending
+    if "active_sidebar_tab" not in st.session_state:
+        st.session_state["active_sidebar_tab"] = "Load graph"
+
+    active = st.session_state.get("active_sidebar_tab") or "Load graph"
+    col_load, col_explore = st.columns(2)
+    with col_load:
+        if st.button(
+            "Load graph",
+            key="tab_load_btn",
+            type="primary" if active == "Load graph" else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["active_sidebar_tab"] = "Load graph"
+            st.rerun()
+    with col_explore:
+        if st.button(
+            "Explore",
+            key="tab_explore_btn",
+            type="primary" if active == "Explore" else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["active_sidebar_tab"] = "Explore"
+            st.rerun()
+
+    if not data_loaded:
+        st.caption("Load a graph to enable **Explore**.")
+
+    return active
+
+
+def _render_explore_tab():
+    """Post-load controls: 3D view, graph sample, and neighborhoods."""
+    if st.session_state.get("data") is None:
+        st.info("Load a graph from the **Load graph** tab to explore neighborhoods.")
         return
 
-    data = st.session_state.get("data")
-    dset0 = (
-        data[0] if (data is not None and hasattr(data, "__getitem__")) else data
+    st.toggle(
+        "3D layered view (orbit/zoom)",
+        help=(
+            "Stack ranks as horizontal planes in 3D (multi-incidence, 2+ adjacency, "
+            "or combined incidence+adjacency). Single-matrix views stay 2D."
+        ),
+        key="layered_3d_view",
+        on_change=_on_layered_3d_toggle,
     )
-    lifting_applied = st.session_state.get("lifting_applied")
-    if dset0 is not None and hasattr(dset0, "num_nodes"):
-        num_nodes = dset0.num_nodes
-        if (
-            num_nodes is None
-            and getattr(dset0, "edge_index", None) is not None
-        ):
-            num_nodes = int(dset0.edge_index.max().item()) + 1
-        num_features = (
-            dset0.x.shape[1]
-            if (
-                hasattr(dset0, "x")
-                and dset0.x is not None
-                and len(dset0.x.shape) > 1
-            )
-            else 0
-        )
-        if lifting_applied:
-            st.success(
-                f"Viewing lifted data — **{lifting_applied['name']}** "
-                f"({lifting_applied['source']} → {lifting_applied['target']}) | "
-                f"Nodes: {num_nodes}, "
-                f"Node features: {num_features if num_features else 'N/A'}"
-            )
-        else:
-            st.info(
-                f"Dataset loaded — Nodes: {num_nodes}, "
-                f"Node features: {num_features if num_features else 'N/A'}"
-            )
+
+    st.divider()
+    st.subheader("Graph sample")
+    _render_graph_sample_section()
+
+    st.divider()
+    _render_neighborhood_picker()
+
+
+def _render_graph_canvas():
+    """Main area: D3 embed (title + graph) and download directly below."""
+    embed_html = st.session_state.get("_d3_embed_html")
+    if not embed_html:
+        return
 
     sel_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
-    avail = st.session_state.get("available_neighborhoods") or []
-    if sel_ids:
-        labels = [next((n["label"] for n in avail if n["id"] == s), s) for s in sel_ids]
-        joined_ids = ", ".join(f"`{s}`" for s in sel_ids)
-        joined_labels = "; ".join(labels)
-        st.markdown(f"**Currently displayed:** {joined_ids} — {joined_labels}")
-
-    # ``components.html`` has no ``key=`` in Streamlit 1.50; wrap in a keyed
-    # container so changing the neighborhood remounts the iframe subtree.
     neigh_key = "+".join(sel_ids) if sel_ids else "default"
     with st.container(key=f"d3_embed::{neigh_key}"):
         components.html(embed_html, height=D3_EMBED_HEIGHT, scrolling=False)
 
-    payload = st.session_state.get("_d3_payload")
-    if payload is not None and st.button(
-        "Open graph in new browser window",
-        key="d3_open_current",
-        use_container_width=True,
-    ):
-        open_d3_graph_window(payload)
-
     last_html = st.session_state.get("_d3_last_html")
     if last_html:
         st.download_button(
-            label="Download last D3 graph (HTML)",
+            label="Download graph (HTML)",
             data=last_html,
             file_name="topobench_graph.html",
             mime="text/html",
@@ -3356,13 +3391,22 @@ def main():
         st.success(flash)
 
     available_datasets = discover_available_datasets()
+    data_loaded = st.session_state.get("data") is not None
 
+    sidebar_cfg = None
     with st.sidebar:
-        sidebar_cfg = _render_left_config(available_datasets)
+        st.markdown(
+            '<div class="topo-sidebar-title">TopoExplorer</div>',
+            unsafe_allow_html=True,
+        )
+        tab = _render_sidebar_tab_selector(data_loaded)
+        st.divider()
+        if tab == "Load graph":
+            sidebar_cfg = _render_left_config(available_datasets)
+        else:
+            _render_explore_tab()
 
-    st.header("Graph")
-
-    if sidebar_cfg["load_clicked"]:
+    if sidebar_cfg is not None and sidebar_cfg["load_clicked"]:
         load_cfg = {**sidebar_cfg, **_default_load_sampling_cfg()}
         with st.status("Loading graph…", expanded=True) as status:
             def _progress(msg):
@@ -3375,12 +3419,10 @@ def main():
             else:
                 status.update(label="Load stopped", state="error")
         if ok:
+            st.session_state["_pending_tab"] = "Explore"
             st.rerun()
 
-    if st.session_state.get("data") is not None:
-        _render_graph_sample_section()
-
-    _render_graph_view_rest()
+    _render_graph_canvas()
 
 
 if __name__ == "__main__":

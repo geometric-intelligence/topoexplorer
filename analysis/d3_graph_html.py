@@ -83,6 +83,7 @@ def build_standalone_d3_html(
     header {{ padding: 12px 16px; background: #fff; border-bottom: 1px solid #ccc; }}
     header h1 {{ margin: 0; font-size: 1.1rem; }}
     header p {{ margin: 4px 0 0; color: #555; font-size: 0.85rem; }}
+    header p:empty {{ display: none; margin: 0; }}
     #chart-wrap {{ position: relative; {chart_size_css} }}
     #chart {{ width: 100%; height: 100%; min-height: inherit; }}
     #err {{ color: #b00; padding: 16px; white-space: pre-wrap; font-family: monospace; }}
