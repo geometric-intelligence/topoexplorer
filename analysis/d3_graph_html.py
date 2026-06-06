@@ -106,6 +106,20 @@ def build_standalone_d3_html(
     #legend .legend-dot {{ display: inline-block; width: 12px; height: 12px;
       border-radius: 50%; border: 1px solid rgba(0,0,0,0.18); flex-shrink: 0; }}
     #legend .legend-label {{ color: #222; }}
+    #metrics-hud {{
+      display: none; position: absolute; top: 10px; left: 10px; z-index: 5;
+      background: rgba(255, 255, 255, 0.92); border: 1px solid #d0d0d0;
+      border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.4;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08); pointer-events: none;
+      max-width: min(240px, 60%);
+    }}
+    #metrics-hud .hud-title {{ display: block; font-weight: 600; font-size: 11px;
+      color: #555; letter-spacing: 0.02em; text-transform: uppercase;
+      margin-bottom: 6px; }}
+    #metrics-hud .hud-row {{ display: flex; justify-content: space-between;
+      gap: 12px; margin: 2px 0; }}
+    #metrics-hud .hud-label {{ color: #555; }}
+    #metrics-hud .hud-value {{ color: #111; font-variant-numeric: tabular-nums; }}
   </style>
 </head>
 <body>
@@ -115,6 +129,7 @@ def build_standalone_d3_html(
   </header>
   <div id="err"></div>
   <div id="chart-wrap">
+    <div id="metrics-hud" aria-label="Displayed graph metrics"></div>
     <div id="legend" aria-label="Rank legend"></div>
     <div id="chart"></div>
   </div>
@@ -127,6 +142,20 @@ def build_standalone_d3_html(
   (function() {
     function showError(msg) {
       document.getElementById("err").textContent = msg;
+    }
+    function metricLines(obj) {
+      if (!obj) return "";
+      var parts = [];
+      Object.keys(obj).forEach(function(k) { parts.push(k + ": " + obj[k]); });
+      return parts.length ? ("\\n" + parts.join("\\n")) : "";
+    }
+    function nodeTooltip(d) {
+      return (d.label || d.id) + " — degree " + (d.degree || 0) + metricLines(d.metrics);
+    }
+    function edgeTooltip(l) {
+      var s = (l.source && l.source.id) ? l.source.id : l.source;
+      var t = (l.target && l.target.id) ? l.target.id : l.target;
+      return s + " — " + t + metricLines(l.metrics);
     }
     try {
       const raw = document.getElementById("graph-payload").textContent;
@@ -149,6 +178,26 @@ def build_standalone_d3_html(
           html += '<div class="legend-row">'
             + '<span class="legend-dot" style="background:' + e.color + '"></span>'
             + '<span class="legend-label">' + label + '</span>'
+            + '</div>';
+        });
+        box.innerHTML = html;
+        box.style.display = "block";
+      })();
+
+      (function renderMetricsHud() {
+        var box = document.getElementById("metrics-hud");
+        if (!box) return;
+        var rows = payload.graphMetrics || [];
+        if (!payload.showMetricsHud || rows.length === 0) {
+          box.innerHTML = "";
+          box.style.display = "none";
+          return;
+        }
+        var html = '<span class="hud-title">Displayed graph</span>';
+        rows.forEach(function(r) {
+          html += '<div class="hud-row">'
+            + '<span class="hud-label">' + r.label + '</span>'
+            + '<span class="hud-value">' + r.value + '</span>'
             + '</div>';
         });
         box.innerHTML = html;
@@ -191,7 +240,8 @@ def build_standalone_d3_html(
           return {
             source: String(l.source),
             target: String(l.target),
-            color: l.color
+            color: l.color,
+            metrics: l.metrics
           };
         });
         const graph3d = ForceGraph3D()(chart)
@@ -200,9 +250,10 @@ def build_standalone_d3_html(
           .backgroundColor("#fafafa")
           .nodeRelSize(4)
           .nodeColor(function(n) { return n.color || "#666"; })
-          .nodeLabel(function(n) { return (n.label || n.id) + " — degree " + (n.degree || 0); })
+          .nodeLabel(function(n) { return nodeTooltip(n); })
           .nodeVal(function(n) { return 1 + Math.log1p(n.degree || 1); })
           .linkColor(function(l) { return l.color || "#888"; })
+          .linkLabel(function(l) { return edgeTooltip(l); })
           .linkOpacity(0.6)
           .linkWidth(0.6)
           .graphData({ nodes: nodes3d, links: links3d });
@@ -235,7 +286,8 @@ def build_standalone_d3_html(
         return {
           source: s,
           target: t,
-          color: l.color
+          color: l.color,
+          metrics: l.metrics
         };
       }).filter(function(l) { return l.source && l.target; });
 
@@ -321,6 +373,8 @@ def build_standalone_d3_html(
         .attr("stroke", function(d) { return d.color || "#888"; })
         .attr("stroke-width", 1.2);
 
+      link.append("title").text(function(d) { return edgeTooltip(d); });
+
       const node = g.append("g").selectAll("g")
         .data(nodes)
         .join("g")
@@ -345,9 +399,7 @@ def build_standalone_d3_html(
         .attr("fill", function(d) { return d.color || "#666"; })
         .attr("stroke", function(d) { return d.stroke || "#fff"; });
 
-      node.append("title").text(function(d) {
-        return (d.label || d.id) + " — degree " + (d.degree || 0);
-      });
+      node.append("title").text(function(d) { return nodeTooltip(d); });
 
       node.filter(function(d) { return String(d.id).length <= 12; })
         .append("text")

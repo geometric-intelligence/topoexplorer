@@ -32,6 +32,7 @@ import networkx as nx
 import torch
 
 from d3_graph_html import build_standalone_d3_html
+import graph_metrics as gm
 from omegaconf import OmegaConf
 from torch_geometric.utils import to_undirected
 
@@ -198,9 +199,10 @@ st.markdown(
     [data-testid="stSidebarUserContent"] {{ padding-top: 0.25rem; }}
     /* Large, full-width sidebar tab buttons only. */
     [data-testid="stSidebar"] .st-key-tab_load_btn button,
-    [data-testid="stSidebar"] .st-key-tab_explore_btn button {{
+    [data-testid="stSidebar"] .st-key-tab_explore_btn button,
+    [data-testid="stSidebar"] .st-key-tab_metrics_btn button {{
         height: 3.2rem;
-        font-size: 1.05rem;
+        font-size: 1rem;
         font-weight: 600;
     }}
     </style>
@@ -1964,7 +1966,7 @@ def render_basic_lifting_editor(selected_lifting):
     if st.button(
         "Reset edited config to defaults",
         key=f"cfg_reset::{editor_id}",
-        use_container_width=True,
+        width="stretch",
     ):
         for k in BASIC_EDITABLE_KEYS:
             wk = f"editcfg::{editor_id}::{k}"
@@ -2038,19 +2040,38 @@ def _render_left_config(available_datasets):
     st.header("Data configuration")
 
     with st.expander("Dataset", expanded=True):
+        # Persist domain/dataset across sidebar tab switches via shadow keys
+        # (these selectboxes can't use a widget key because the Dataset options
+        # change with the Domain, which would invalidate a stored key value).
+        domain_options = list(available_datasets.keys())
+        prev_domain = st.session_state.get("cfg_domain")
+        domain_index = (
+            domain_options.index(prev_domain)
+            if prev_domain in domain_options
+            else 0
+        )
         selected_domain = st.selectbox(
             "Domain",
-            options=list(available_datasets.keys()),
-            index=0,
+            options=domain_options,
+            index=domain_index,
             help="Topological domain (folder under configs/dataset).",
         )
+        st.session_state["cfg_domain"] = selected_domain
+
         datasets_in_domain = available_datasets.get(selected_domain, [])
+        prev_dataset = st.session_state.get("cfg_dataset")
+        dataset_index = (
+            datasets_in_domain.index(prev_dataset)
+            if prev_dataset in datasets_in_domain
+            else 0
+        )
         selected_dataset = st.selectbox(
             "Dataset",
             options=datasets_in_domain,
-            index=0,
+            index=dataset_index,
             help=f"YAML stem under configs/dataset/{selected_domain}/",
         )
+        st.session_state["cfg_dataset"] = selected_dataset
         st.caption(f"**{selected_domain}** / **{selected_dataset}**")
         _render_dataset_metadata_card(selected_domain, selected_dataset)
 
@@ -2126,7 +2147,7 @@ def _render_left_config(available_datasets):
     load_clicked = st.button(
         "Load graph",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="load_graph_btn",
     )
 
@@ -2303,6 +2324,16 @@ def _on_layered_3d_toggle():
     _rebuild_embed_for_neighborhoods(ids)
 
 
+def _on_metrics_option_change():
+    """Re-embed when a metrics toggle changes (HUD visibility / advanced compute)."""
+    if st.session_state.get("data") is None:
+        return
+    ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if not ids:
+        return
+    _rebuild_embed_for_neighborhoods(ids)
+
+
 def _on_adjacency_toggle():
     """Toggling an adjacency checkbox keeps the union of checked
     incidences and adjacencies."""
@@ -2339,6 +2370,66 @@ def _commit_selection(new_ids):
     st.session_state["selected_neighborhood_ids"] = new_ids
     _sync_picker_widget_state(new_ids)
     _rebuild_embed_for_neighborhoods(new_ids)
+
+
+def _metrics_marker(neigh_ids, expensive):
+    """Cache key for displayed-graph metrics.
+
+    Includes everything that changes the displayed graph (selection, sampling
+    snapshot, graph index, lifting) plus the expensive flag. Deliberately
+    excludes the 2D/3D toggle and the HUD on/off toggle so those never trigger
+    a recompute.
+    """
+    return "|".join(
+        [
+            "+".join(neigh_ids),
+            f"max={st.session_state.get('_loaded_max_nodes')}",
+            f"min={st.session_state.get('_loaded_min_degree')}",
+            f"idx={st.session_state.get('active_graph_index')}",
+            f"lift={st.session_state.get('lifting_applied')}",
+            f"exp={bool(expensive)}",
+        ]
+    )
+
+
+def _compute_and_attach_metrics(payload, G_load, neigh_ids):
+    """Compute displayed-graph metrics (cached) and attach them to the payload."""
+    if not isinstance(payload, dict):
+        return
+
+    expensive = bool(st.session_state.get("metrics_expensive", False))
+    marker = _metrics_marker(neigh_ids, expensive)
+    cached = st.session_state.get("_graph_metrics")
+    if cached and cached.get("marker") == marker:
+        metrics = cached.get("data")
+    else:
+        try:
+            metrics = gm.compute_graph_metrics(
+                G_load,
+                view_label=payload.get("graphType", "graph"),
+                expensive=expensive,
+            )
+            st.session_state.pop("_graph_metrics_error", None)
+        except Exception as e:  # never break the embed over metrics
+            metrics = None
+            st.session_state["_graph_metrics_error"] = str(e)
+        st.session_state["_graph_metrics"] = {"marker": marker, "data": metrics}
+
+    if not metrics:
+        return
+
+    payload["graphMetrics"] = gm.build_hud_rows(metrics)
+    payload["showMetricsHud"] = bool(
+        st.session_state.get("show_metrics_hud", True)
+    )
+    for nd in payload.get("nodes", []):
+        nm = gm.node_payload_metrics(metrics, nd.get("id"))
+        if nm:
+            nd["metrics"] = nm
+    for ln in payload.get("links", []):
+        em = gm.edge_payload_metrics(metrics, ln.get("source"), ln.get("target"))
+        if em:
+            ln["metrics"] = em
 
 
 def _rebuild_embed_for_neighborhoods(neigh_ids):
@@ -2674,6 +2765,8 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     )
     payload["subtitle"] = ""
 
+    _compute_and_attach_metrics(payload, G_load, neigh_ids)
+
     embed_html = build_standalone_d3_html(
         payload,
         embed=True,
@@ -2697,8 +2790,18 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     return True
 
 
-def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name):
-    """Populate neighborhoods, sampling, and embed for a working sample."""
+def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name,
+                            sync_widgets=True):
+    """Populate neighborhoods, sampling, and embed for a working sample.
+
+    ``sync_widgets`` controls whether the sampling widget keys (``ui_min_degree``,
+    ``ui_rank_cap_*``, ``ui_hyperedge_cap``) are written. This is safe only on
+    the initial load or from on_change callbacks (before widgets are
+    re-instantiated). It must be ``False`` when called inline after those
+    widgets already exist in the current run (e.g. the "Apply to all" button),
+    otherwise Streamlit raises "cannot be modified after the widget is
+    instantiated".
+    """
     rank_labels_for_payload = get_rank_labels(
         loaded_domain, dataset_name, dset0
     )
@@ -2745,15 +2848,16 @@ def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name):
         hyperedge_cap = max(0, min(int(hyperedge_cap), int(num_hyperedges)))
 
     min_degree = int(cfg.get("min_degree", 0))
-    for rank, cap in caps_by_rank.items():
-        st.session_state[f"ui_rank_cap_{rank}"] = int(cap)
-    if (
-        hyperedge_cap is not None
-        and num_hyperedges is not None
-        and int(num_hyperedges) > 1
-    ):
-        st.session_state["ui_hyperedge_cap"] = int(hyperedge_cap)
-    st.session_state["ui_min_degree"] = min_degree
+    if sync_widgets:
+        for rank, cap in caps_by_rank.items():
+            st.session_state[f"ui_rank_cap_{rank}"] = int(cap)
+        if (
+            hyperedge_cap is not None
+            and num_hyperedges is not None
+            and int(num_hyperedges) > 1
+        ):
+            st.session_state["ui_hyperedge_cap"] = int(hyperedge_cap)
+        st.session_state["ui_min_degree"] = min_degree
 
     st.session_state["rank_populations"] = rank_pops
     st.session_state["hyperedge_population"] = num_hyperedges
@@ -2937,7 +3041,7 @@ def _render_rank_cap_sliders(rank_populations, hyperedge_population):
             st.write("")
             if st.button(
                 "Apply to all",
-                use_container_width=True,
+                width="stretch",
                 key="ui_apply_all_rank_caps",
             ):
                 for rank, pop in rank_populations.items():
@@ -3115,7 +3219,9 @@ def _on_sampling_control_change():
     dset0 = data[0] if hasattr(data, "__getitem__") else data
     loaded_domain = st.session_state.get("data_domain")
     dataset_name = st.session_state.get("dataset_name")
-    ok = _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name)
+    ok = _finalize_loaded_sample(
+        dset0, cfg, loaded_domain, dataset_name, sync_widgets=False
+    )
     if ok:
         snap = st.session_state.get("_load_cfg_snapshot") or {}
         snap["caps_by_rank"] = copy.deepcopy(cfg.get("caps_by_rank") or {})
@@ -3300,8 +3406,8 @@ def _do_load_graph(cfg, progress=None):
 
 
 def _render_sidebar_tab_selector(data_loaded):
-    """Large two-tab selector backed by session state (survives reruns)."""
-    options = ["Load graph", "Explore"]
+    """Large three-tab selector backed by session state (survives reruns)."""
+    options = ["Load graph", "Explore", "Metrics"]
 
     # Apply a programmatic switch requested on a previous run (e.g. after a
     # successful load). Must happen BEFORE the tab buttons are rendered.
@@ -3312,13 +3418,13 @@ def _render_sidebar_tab_selector(data_loaded):
         st.session_state["active_sidebar_tab"] = "Load graph"
 
     active = st.session_state.get("active_sidebar_tab") or "Load graph"
-    col_load, col_explore = st.columns(2)
+    col_load, col_explore, col_metrics = st.columns(3)
     with col_load:
         if st.button(
             "Load graph",
             key="tab_load_btn",
             type="primary" if active == "Load graph" else "secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state["active_sidebar_tab"] = "Load graph"
             st.rerun()
@@ -3327,13 +3433,22 @@ def _render_sidebar_tab_selector(data_loaded):
             "Explore",
             key="tab_explore_btn",
             type="primary" if active == "Explore" else "secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state["active_sidebar_tab"] = "Explore"
             st.rerun()
+    with col_metrics:
+        if st.button(
+            "Metrics",
+            key="tab_metrics_btn",
+            type="primary" if active == "Metrics" else "secondary",
+            width="stretch",
+        ):
+            st.session_state["active_sidebar_tab"] = "Metrics"
+            st.rerun()
 
     if not data_loaded:
-        st.caption("Load a graph to enable **Explore**.")
+        st.caption("Load a graph to enable **Explore** and **Metrics**.")
 
     return active
 
@@ -3362,6 +3477,121 @@ def _render_explore_tab():
     _render_neighborhood_picker()
 
 
+def _render_metrics_tab():
+    """Displayed-graph metrics tab: HUD toggle, whole-graph table, top elements."""
+    if st.session_state.get("data") is None:
+        st.info("Load a graph from the **Load graph** tab to see metrics.")
+        return
+
+    err = st.session_state.get("_graph_metrics_error")
+    if err:
+        st.caption(f"Metrics unavailable: {err}")
+        return
+
+    cached = st.session_state.get("_graph_metrics") or {}
+    metrics = cached.get("data")
+    if not metrics:
+        st.caption("Metrics will appear once a graph is displayed.")
+        return
+
+    st.toggle(
+        "Show metrics overlay",
+        value=bool(st.session_state.get("show_metrics_hud", True)),
+        key="show_metrics_hud",
+        help="Compact whole-graph metrics in the top-left of the graph canvas.",
+        on_change=_on_metrics_option_change,
+    )
+
+    flags = metrics.get("flags") or {}
+    for note in flags.get("notes", []):
+        st.caption(note)
+
+    graph = metrics.get("graph") or {}
+    scope = metrics.get("graph_scope") or {}
+    label_map = dict(gm.GRAPH_METRIC_LABELS)
+    rows = []
+    for key, _label in gm.GRAPH_METRIC_LABELS:
+        if key not in graph or graph.get(key) is None:
+            continue
+        label = label_map.get(key, key)
+        if key in scope:
+            label = f"{label} ({scope[key]})"
+        rows.append({"Metric": label, "Value": gm.fmt_value(graph[key])})
+    if rows:
+        st.caption("Displayed graph (after sampling)")
+        st.dataframe(rows, hide_index=True, width="stretch")
+
+    _render_metrics_top_elements(metrics)
+
+    with st.expander("Advanced metrics"):
+        st.checkbox(
+            "Compute advanced metrics (betweenness, closeness, eccentricity, …)",
+            value=bool(st.session_state.get("metrics_expensive", False)),
+            key="metrics_expensive",
+            help=(
+                "Heavier centralities. May be slow or approximated on large "
+                "graphs; betweenness uses sampling above ~800 nodes."
+            ),
+            on_change=_on_metrics_option_change,
+        )
+        if flags.get("betweenness_approx"):
+            st.caption("Betweenness is approximated (k-sampled) for this graph.")
+        if not flags.get("expensive"):
+            st.caption("Enable to add per-node/edge centralities to tooltips and tables.")
+
+
+def _render_metrics_top_elements(metrics):
+    """Top-k nodes by a chosen centrality plus Forman-Ricci extremes."""
+    nodes = metrics.get("nodes") or {}
+    if not nodes:
+        return
+
+    sample = next(iter(nodes.values()), {})
+    centrality_opts = [
+        (k, lbl)
+        for k, lbl in [
+            ("degree_centrality", "Degree centrality"),
+            ("betweenness", "Betweenness"),
+            ("closeness", "Closeness"),
+            ("eigenvector", "Eigenvector"),
+            ("pagerank", "PageRank"),
+            ("clustering", "Clustering"),
+        ]
+        if k in sample and sample.get(k) is not None
+    ]
+    if centrality_opts:
+        keys = [k for k, _ in centrality_opts]
+        labels = {k: lbl for k, lbl in centrality_opts}
+        choice = st.selectbox(
+            "Top nodes by",
+            options=keys,
+            format_func=lambda k: labels.get(k, k),
+            key="metrics_top_centrality",
+        )
+        summary = gm.summarize_metrics(metrics, centrality=choice, top_k=5)
+        top_rows = [
+            {"Node": nid, labels.get(choice, choice): gm.fmt_value(val)}
+            for nid, val in summary["top_nodes"]
+        ]
+        if top_rows:
+            st.dataframe(top_rows, hide_index=True, width="stretch")
+
+    edges = metrics.get("edges") or {}
+    if edges:
+        summary = gm.summarize_metrics(metrics, top_k=5)
+        neg = summary["forman_most_negative"]
+        if neg:
+            st.caption("Most negative Forman-Ricci edges")
+            st.dataframe(
+                [
+                    {"Edge": f"{u} — {v}", "Forman": gm.fmt_value(val)}
+                    for (u, v), val in neg
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+
 def _render_graph_canvas():
     """Main area: D3 embed (title + graph) and download directly below."""
     embed_html = st.session_state.get("_d3_embed_html")
@@ -3371,7 +3601,7 @@ def _render_graph_canvas():
     sel_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
     neigh_key = "+".join(sel_ids) if sel_ids else "default"
     with st.container(key=f"d3_embed::{neigh_key}"):
-        components.html(embed_html, height=D3_EMBED_HEIGHT, scrolling=False)
+        st.iframe(embed_html, height=D3_EMBED_HEIGHT)
 
     last_html = st.session_state.get("_d3_last_html")
     if last_html:
@@ -3381,11 +3611,41 @@ def _render_graph_canvas():
             file_name="topobench_graph.html",
             mime="text/html",
             key="d3_download_main",
-            use_container_width=True,
+            width="stretch",
         )
 
 
+_PERSIST_WIDGET_KEYS = frozenset(
+    {
+        "use_lifting",
+        "ui_min_degree",
+        "ui_hyperedge_cap",
+        "ui_set_all_rank_caps",
+        "layered_3d_view",
+        "main_graph_index_input",
+        "show_metrics_hud",
+        "metrics_expensive",
+    }
+)
+
+
+def _persist_widget_state():
+    """Keep sidebar widget selections alive across tab switches.
+
+    Streamlit drops the session_state entry of any keyed widget that is not
+    rendered on a run (e.g. Explore/Metrics widgets while the Load graph tab is
+    showing). Re-assigning those keys here -- before any widget is instantiated
+    this run -- opts them out of that cleanup so selections survive when the
+    user switches sidebar tabs.
+    """
+    for key in list(st.session_state.keys()):
+        if key in _PERSIST_WIDGET_KEYS or key.startswith("ui_rank_cap_"):
+            st.session_state[key] = st.session_state[key]
+
+
 def main():
+    _persist_widget_state()
+
     flash = st.session_state.pop("_flash_ok", None)
     if flash:
         st.success(flash)
@@ -3403,6 +3663,8 @@ def main():
         st.divider()
         if tab == "Load graph":
             sidebar_cfg = _render_left_config(available_datasets)
+        elif tab == "Metrics":
+            _render_metrics_tab()
         else:
             _render_explore_tab()
 
