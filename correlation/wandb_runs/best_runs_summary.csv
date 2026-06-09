@@ -1,0 +1,33 @@
+dataset_name,model_type,model_category,config.model.model_domain,score_name,score,score_std,val_score,run_count,config.model.tune_gnn,config.model.backbone.neighborhoods,config.model.backbone.GNN.num_layers,config.model.feature_encoder.out_channels,config.model.feature_encoder.proj_dropout,config.optimizer.parameters.lr,config.optimizer.parameters.weight_decay,config.dataset.dataloader_params.batch_size
+BBB_Martins,gin,baselines_best,graph,accuracy,0.8287356350156996,0.0091949425947837,0.8837438450919257,45,,,,256.0,0.25,0.001,0.0001,256.0
+BBB_Martins,topotune,topotune_cell,cell,accuracy,0.853201973438263,0.0164859126819999,0.906403923034668,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,256.0,0.5,0.01,0.0001,128.0
+BBB_Martins,topotune,topotune_simplicial,simplicial,accuracy,0.83103449344635,0.002808300798617,0.9054187297821044,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",1.0,256.0,0.25,0.01,0.0001,128.0
+CYP3A4_Veith,gat,baselines_best,graph,accuracy,0.7760295629501343,0.0084972867178008,0.7914030803574457,45,,,,256.0,0.5,0.001,0.0001,128.0
+CYP3A4_Veith,topotune,topotune_cell,cell,accuracy,0.7864557862281799,0.003553764595866,0.8235198616981506,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,256.0,0.5,0.01,0.0001,256.0
+CYP3A4_Veith,topotune,topotune_simplicial,simplicial,accuracy,0.7788321256637574,0.0046111325727893,0.8207623720169067,5,GIN,['up_adjacency-0'],2.0,128.0,0.5,0.01,0.0001,256.0
+Caco2_Wang,gat,baselines_best,graph,mae,1.104136468304528,0.1495468144098443,1.075055368741353,45,,,,128.0,0.25,0.01,0.0001,128.0
+Caco2_Wang,topotune,topotune_cell,cell,mae,0.8480376362800598,0.0029453658539542,0.7860114812850952,5,GCN,['up_adjacency-0'],4.0,128.0,0.25,0.01,0.0001,128.0
+Caco2_Wang,topotune,topotune_simplicial,simplicial,mae,0.7557640314102173,0.0328332359765273,0.6823072075843811,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",4.0,128.0,0.25,0.01,0.0001,128.0
+Clearance_Hepatocyte_AZ,gat,baselines_best,graph,mae,36.614068264431424,2.396942435783505,35.08010423448351,45,,,,128.0,0.25,0.01,0.0001,128.0
+Clearance_Hepatocyte_AZ,topotune,topotune_cell,cell,mae,36.68585891723633,0.5200598562191215,31.973246002197264,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,128.0,0.5,0.01,0.0001,256.0
+Clearance_Hepatocyte_AZ,topotune,topotune_simplicial,simplicial,mae,35.03855819702149,1.4064841714448637,32.43352355957031,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",4.0,128.0,0.25,0.01,0.0001,128.0
+MUTAG,gat,baselines_best,graph,accuracy,0.7862884177101983,0.0936209428882817,0.8401891337500678,45,,,,128.0,0.25,0.001,0.0,256.0
+MUTAG,topotune,topotune_cell,cell,accuracy,0.7617021322250366,0.069597584466088,0.8382978916168213,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",4.0,256.0,0.5,0.01,0.0001,256.0
+MUTAG,topotune,topotune_simplicial,simplicial,accuracy,0.8425531983375549,0.0910180922147759,0.8936170339584351,5,GIN,['up_adjacency-0'],4.0,128.0,0.5,0.01,0.0001,128.0
+NCI1,gat,baselines_best,graph,accuracy,0.7305447578430175,0.0155005068135775,0.7422698219617208,45,,,,128.0,0.25,0.01,0.0001,128.0
+NCI1,topotune,topotune_cell,cell,accuracy,0.772762656211853,0.0169411483926215,0.7924050569534302,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,128.0,0.5,0.01,0.0001,128.0
+NCI1,topotune,topotune_simplicial,simplicial,accuracy,0.7677042841911316,0.0163701690615622,0.7834469199180603,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",4.0,128.0,0.25,0.01,0.0001,128.0
+NCI109,gat,baselines_best,graph,accuracy,0.721910293896993,0.0164159750384964,0.7388511644469367,45,,,,128.0,0.25,0.01,0.0,128.0
+NCI109,topotune,topotune_cell,cell,accuracy,0.7523717403411865,0.0191347031125536,0.7773035883903503,5,GCN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,128.0,0.25,0.01,0.0001,256.0
+NCI109,topotune,topotune_simplicial,simplicial,accuracy,0.7579864501953125,0.0143422379785472,0.7873908877372742,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",4.0,256.0,0.5,0.01,0.0001,128.0
+PROTEINS,gcn,baselines_best,graph,accuracy,0.7449621677398681,0.0274455460936299,0.7619504438506233,45,,,,128.0,0.5,0.01,0.0,128.0
+PROTEINS,topotune,topotune_cell,cell,accuracy,0.7354838728904725,0.0190335566708185,0.7712230205535888,5,GCN,['up_adjacency-0'],2.0,128.0,0.5,0.01,0.0001,128.0
+PROTEINS,topotune,topotune_simplicial,simplicial,accuracy,0.7612903118133545,0.015540844942046,0.7755395650863648,5,GIN,"['up_incidence-0', '2-up_incidence-0']",4.0,128.0,0.25,0.01,0.0001,128.0
+mantra_betti_number_1,gin,baselines_best,graph,f1,0.8720348238945007,0.0261867499389183,0.8810177458657159,45,,,,128.0,0.25,0.001,0.0001,128.0
+mantra_betti_number_1,topotune,topotune_simplicial,simplicial,f1,0.8977366328239441,0.0029692428017898,0.9089234113693238,5,GIN,"['up_adjacency-0', 'up_adjacency-1', '2-up_adjacency-0', 'down_adjacency-1', 'down_adjacency-2', '2-down_adjacency-2']",4.0,128.0,0.5,0.01,0.0,128.0
+mantra_betti_number_2,gin,baselines_best,graph,f1,0.519088351726532,0.0410195195183531,0.5188062204254998,45,,,,256.0,0.25,0.001,0.0001,128.0
+mantra_betti_number_2,topotune,topotune_simplicial,simplicial,f1,0.8036990523338318,0.022017488112066,0.8076133728027344,5,GIN,"['up_adjacency-0', 'up_adjacency-1', '2-up_adjacency-0', 'down_adjacency-1', 'down_adjacency-2', '2-down_adjacency-2']",4.0,128.0,0.5,0.01,0.0,128.0
+mantra_name,gin,baselines_best,graph,f1,0.7641712082756891,0.0098314326340594,0.7653505537245009,45,,,,128.0,0.25,0.001,0.0001,256.0
+mantra_name,topotune,topotune_simplicial,simplicial,f1,0.8795015573501587,0.0064136073187638,0.8845606327056885,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,128.0,0.25,0.01,0.0,256.0
+mantra_orientation,gin,baselines_best,graph,f1,0.5629333986176385,0.0047132645756138,0.5591530640920003,45,,,,128.0,0.5,0.001,0.0001,256.0
+mantra_orientation,topotune,topotune_simplicial,simplicial,f1,0.7542657852172852,0.0122564337032236,0.7607099056243897,5,GIN,"['up_adjacency-0', '2-up_adjacency-0']",2.0,256.0,0.25,0.01,0.0,128.0
