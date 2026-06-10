@@ -196,3 +196,5 @@ wandb/
 # test temporary
 .test_tmp/
 uv.lock".venv/" 
+
+/correlation/wandb_runs/
