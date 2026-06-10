@@ -307,6 +307,36 @@ def rank_color(rank):
     return DEFAULT_RANK_PALETTE[int(rank) % len(DEFAULT_RANK_PALETTE)]
 
 
+def blend_hex(*hex_colors):
+    """Average several ``#rrggbb`` colors channel-wise.
+
+    Returns ``"#888888"`` if nothing parseable is provided. Used to color
+    adjacency edges that come from multiple via-ranks (overlap blend) and
+    as the 3D solid fallback for incidence edges.
+    """
+    rs, gs, bs = [], [], []
+    for c in hex_colors:
+        if not isinstance(c, str):
+            continue
+        c = c.strip()
+        if c.startswith("#"):
+            c = c[1:]
+        if len(c) != 6:
+            continue
+        try:
+            rs.append(int(c[0:2], 16))
+            gs.append(int(c[2:4], 16))
+            bs.append(int(c[4:6], 16))
+        except ValueError:
+            continue
+    if not rs:
+        return "#888888"
+    r = sum(rs) // len(rs)
+    g = sum(gs) // len(gs)
+    b = sum(bs) // len(bs)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 _FRIENDLY_RANK_NAMES = {0: "Nodes", 1: "Edges", 2: "Faces", 3: "Volumes"}
 
 
@@ -584,66 +614,184 @@ def _connectivity_keys_present(data, kind: str):
     return sorted(set(ranks))
 
 
-def enumerate_neighborhoods(data):
-    """
-    List visualizable neighborhoods on a (possibly lifted) ``Data`` object.
+def detect_max_rank(data):
+    """Return the maximum cell rank present on ``data``, or -1 if none found."""
+    max_k = -1
+    for key in _data_keys(data):
+        m = re.match(r"^incidence_(\d+)$", key)
+        if m:
+            max_k = max(max_k, int(m.group(1)))
+        m = re.match(r"^adjacency_(\d+)$", key)
+        if m:
+            max_k = max(max_k, int(m.group(1)))
+    return max_k
 
-    Empty matrices (zero nnz) are filtered out. Order: raw ``graph``,
-    ``hyperedges``, ``incidence_k`` ascending, ``adjacency_k`` ascending.
+
+_RAW_CONNECTIVITY_PREFIXES = (
+    "incidence", "adjacency", "coadjacency",
+    "up_laplacian", "down_laplacian", "hodge_laplacian",
+)
+
+
+def build_raw_connectivity_dict(data, max_rank):
+    """Collect raw connectivity matrices from ``data`` into a dict.
+
+    Matches the key schema produced by ``get_complex_connectivity``:
+    ``{prefix}_{k}`` for each prefix and rank 0..max_rank.
+    """
+    connectivity = {}
+    for prefix in _RAW_CONNECTIVITY_PREFIXES:
+        for k in range(max_rank + 1):
+            key = f"{prefix}_{k}"
+            attr = _get_data_attr(data, key)
+            if attr is not None:
+                sp = _to_sparse_coo(attr)
+                if sp is not None:
+                    connectivity[key] = sp
+    return connectivity
+
+
+def generate_all_neighborhoods(max_rank):
+    """Generate all valid TopoBench neighborhood strings for a given max_rank.
+
+    Returns a flat list of strings in ``r-direction_type-src_rank`` format.
+    """
+    neighborhoods = []
+    for src_rank in range(max_rank + 1):
+        for r in range(1, max_rank + 1):
+            if src_rank + r <= max_rank:
+                neighborhoods.append(f"{r}-up_adjacency-{src_rank}")
+                neighborhoods.append(f"{r}-up_incidence-{src_rank}")
+    for src_rank in range(1, max_rank + 1):
+        for r in range(1, max_rank + 1):
+            if src_rank - r >= 0:
+                neighborhoods.append(f"{r}-down_adjacency-{src_rank}")
+                neighborhoods.append(f"{r}-down_incidence-{src_rank}")
+    return neighborhoods
+
+
+def parse_neighborhood(neighborhood_str):
+    """Parse ``r-direction_type-src_rank`` into ``(r, direction, ntype, src_rank)``.
+
+    Also accepts the short form ``direction_type-src_rank`` (r defaults to 1).
+    """
+    parts = neighborhood_str.split("-")
+    if len(parts) == 3:
+        r = int(parts[0])
+        direction, ntype = parts[1].split("_", 1)
+        src_rank = int(parts[2])
+    elif len(parts) == 2:
+        r = 1
+        direction, ntype = parts[0].split("_", 1)
+        src_rank = int(parts[1])
+    else:
+        raise ValueError(f"Cannot parse neighborhood string: {neighborhood_str!r}")
+    return r, direction, ntype, src_rank
+
+
+def _neighborhood_target_rank(neighborhood_str):
+    """Return the target rank for a TopoBench neighborhood string."""
+    r, direction, _ntype, src_rank = parse_neighborhood(neighborhood_str)
+    if direction == "up":
+        return src_rank + r
+    return src_rank - r
+
+
+def _describe_neighborhood(neighborhood_str, rank_labels=None):
+    """Human-readable label for a TopoBench neighborhood string."""
+    r, direction, ntype, src_rank = parse_neighborhood(neighborhood_str)
+    arrow = "↑" if direction == "up" else "↓"
+    if rank_labels:
+        src_label = rank_labels.get(src_rank, f"Rank {src_rank}")
+    else:
+        src_label = f"Rank {src_rank}"
+
+    if ntype == "adjacency":
+        via_rank = src_rank + r if direction == "up" else src_rank - r
+        if rank_labels:
+            via_label = rank_labels.get(via_rank, f"Rank {via_rank}")
+        else:
+            via_label = f"Rank {via_rank}"
+        return f"{src_label} ↔ {src_label} (via {via_label}, r={r}) {arrow}"
+    else:
+        tgt_rank = src_rank + r if direction == "up" else src_rank - r
+        if rank_labels:
+            tgt_label = rank_labels.get(tgt_rank, f"Rank {tgt_rank}")
+        else:
+            tgt_label = f"Rank {tgt_rank}"
+        return f"{src_label} → {tgt_label} (r={r}) {arrow}"
+
+
+def compute_all_topobench_neighborhoods(data):
+    """Compute all valid non-empty TopoBench neighborhoods for ``data``.
+
+    Returns a dict mapping neighborhood strings to sparse COO tensors,
+    or an empty dict if the data has no lifted connectivity.
+    """
+    max_rank = detect_max_rank(data)
+    if max_rank < 1:
+        return {}
+
+    connectivity = build_raw_connectivity_dict(data, max_rank)
+    if not connectivity:
+        return {}
+
+    all_nbrs = generate_all_neighborhoods(max_rank)
+    if not all_nbrs:
+        return {}
+
+    try:
+        from topobench.data.utils import select_neighborhoods_of_interest
+    except ImportError:
+        return {}
+
+    result = {}
+    for nb_str in all_nbrs:
+        try:
+            computed = select_neighborhoods_of_interest(
+                connectivity, [nb_str]
+            )
+        except Exception:
+            continue
+        tensor = computed.get(nb_str)
+        if tensor is None:
+            continue
+        try:
+            sp = tensor.coalesce() if tensor.is_sparse else tensor
+            if sp._nnz() > 0:
+                result[nb_str] = sp
+        except Exception:
+            continue
+    return result
+
+
+def enumerate_neighborhoods(data):
+    """List non-empty TopoBench-format neighborhoods on a lifted ``Data`` object.
 
     Returns
     -------
     list[dict]
         Items shaped like
-        ``{"id": str, "label": str, "kind": str, "rank": int | None}``.
+        ``{"id": str, "label": str, "kind": str, "rank": int | None}``
+        where ``kind`` is ``tb_incidence`` or ``tb_adjacency``.
     """
     out = []
-
-    adj = edge_index_to_sparse_adj(data)
-    if adj is not None and _sparse_coo_nnz(adj) > 0:
-        out.append({
-            "id": "graph",
-            "label": "graph — edge_index adjacency",
-            "kind": "graph",
-            "rank": None,
-        })
-
-    hyper = incidence_to_sparse_incidence(data)
-    if hyper is not None and _sparse_coo_nnz(hyper) > 0:
-        out.append({
-            "id": "hyperedges",
-            "label": "incidence_hyperedges — Rank 0 → hyperedges",
-            "kind": "hyperedges",
-            "rank": None,
-        })
-
-    for k in _connectivity_keys_present(data, "incidence"):
-        # ``incidence_0`` can appear in some liftings as an augmentation artifact.
-        # Hide it from user-facing neighborhoods to avoid confusing "Rank -1" labels.
-        if k <= 0:
-            continue
-        sp = incidence_rank_k_to_sparse(data, k)
-        nnz = _sparse_coo_nnz(sp)
-        if nnz == 0:
-            continue
-        out.append({
-            "id": f"incidence_{k}",
-            "label": f"incidence_{k} — Rank {k - 1} → Rank {k}",
-            "kind": "incidence",
-            "rank": k,
-        })
-
-    for k in _connectivity_keys_present(data, "adjacency"):
-        sp = adjacency_rank_k_to_sparse(data, k)
-        nnz = _sparse_coo_nnz(sp)
-        if nnz == 0:
-            continue
-        out.append({
-            "id": f"adjacency_{k}",
-            "label": f"adjacency_{k} — Rank {k} ↔ Rank {k}",
-            "kind": "adjacency",
-            "rank": k,
-        })
+    tb_cache = st.session_state.get("_topobench_neighborhoods") or {}
+    type_order = ["up_incidence", "down_incidence", "up_adjacency", "down_adjacency"]
+    for ntype in type_order:
+        matching = sorted(
+            (k for k in tb_cache if ntype in k),
+            key=lambda s: (parse_neighborhood(s)[3], parse_neighborhood(s)[0]),
+        )
+        for nb_str in matching:
+            _r, _direction, kind_str, src_rank = parse_neighborhood(nb_str)
+            kind_tag = "tb_adjacency" if kind_str == "adjacency" else "tb_incidence"
+            out.append({
+                "id": nb_str,
+                "label": f"{nb_str} — {_describe_neighborhood(nb_str)}",
+                "kind": kind_tag,
+                "rank": src_rank,
+            })
 
     return out
 
@@ -701,36 +849,54 @@ def get_named_visualization_matrix(data, neigh_id):
         return (
             sp,
             f"adjacency_{k} (Rank {k} ↔ Rank {k})",
-            {"type": "adjacency", "source_rank": k},
+            {"type": "adjacency", "source_rank": k, "via_rank": k + 1},
         )
+
+    tb_cache = st.session_state.get("_topobench_neighborhoods") or {}
+    if neigh_id in tb_cache:
+        sp = tb_cache[neigh_id]
+        r, direction, ntype, src_rank = parse_neighborhood(neigh_id)
+        desc = _describe_neighborhood(neigh_id)
+        if ntype == "adjacency":
+            via_rank = src_rank + r if direction == "up" else src_rank - r
+            relation_ctx = {
+                "type": "adjacency",
+                "source_rank": src_rank,
+                "via_rank": via_rank,
+            }
+        else:
+            tgt_rank = _neighborhood_target_rank(neigh_id)
+            relation_ctx = {
+                "type": "bipartite",
+                "source_rank": src_rank,
+                "target_rank": tgt_rank,
+            }
+        return sp, f"{neigh_id} ({desc})", relation_ctx
 
     return None, None, None
 
 
 def pick_default_neighborhood_id(available):
-    """
-    Pick a sensible default from ``enumerate_neighborhoods`` output.
+    """Pick a sensible default neighborhood from the catalog.
 
-    Preference order: highest-rank ``incidence_k`` with k>=2, then
-    ``incidence_1``, then ``graph``, then ``hyperedges``, then first item.
+    Preference: the smallest-r ``up_incidence`` at the lowest source rank
+    (typically ``1-up_incidence-0``), then any incidence item, then any item.
     """
     if not available:
         return None
-    by_id = {n["id"]: n for n in available}
 
-    incidence_ranks = sorted(
-        (n["rank"] for n in available if n["kind"] == "incidence"),
-        reverse=True,
+    def _key(n):
+        try:
+            r, direction, ntype, src = parse_neighborhood(n["id"])
+        except Exception:
+            return (9, 9, 9)
+        return (src, r, 0 if direction == "up" else 1)
+
+    incidences = sorted(
+        [n for n in available if n["kind"] == "tb_incidence"], key=_key
     )
-    for k in incidence_ranks:
-        if k >= 2:
-            return f"incidence_{k}"
-    if any(n["id"] == "incidence_1" for n in available):
-        return "incidence_1"
-    if "graph" in by_id:
-        return "graph"
-    if "hyperedges" in by_id:
-        return "hyperedges"
+    if incidences:
+        return incidences[0]["id"]
     return available[0]["id"]
 
 
@@ -1188,25 +1354,35 @@ def networkx_to_d3_payload(
             nd["layer"] = int(layer)
         nodes_out.append(nd)
 
-    inc_stroke = "#888888"
     if graph_type == "adjacency":
-        adj_c = rank_color(src_rank)
+        via_rank = (relation_context or {}).get("via_rank", src_rank)
+        adj_c = rank_color(via_rank)
         links_out = [
             {
                 "source": str(u),
                 "target": str(v),
                 "color": adj_c,
                 "kind": "adjacency",
+                "viaRanks": [int(via_rank)],
             }
             for u, v in G.edges()
         ]
     else:
+        # Reversed gradient between the two ranks: at the source endpoint
+        # paint with the target rank color and vice versa.
+        color_at_src = rank_color(target_rank)
+        color_at_tgt = rank_color(src_rank)
+        midpoint = blend_hex(color_at_src, color_at_tgt)
         links_out = [
             {
                 "source": str(u),
                 "target": str(v),
-                "color": inc_stroke,
+                "color": midpoint,
+                "colorStart": color_at_src,
+                "colorEnd": color_at_tgt,
                 "kind": "incidence",
+                "srcRank": src_rank,
+                "tgtRank": target_rank,
             }
             for u, v in G.edges()
         ]
@@ -1359,47 +1535,51 @@ def build_layered_adjacency_networkx(
     min_degree: int = 0,
     selected_by_rank=None,
 ):
-    """Stack multiple ``adjacency_k`` matrices into a layered rank-wise graph."""
+    """Stack multiple adjacency matrices into a layered rank-wise graph.
+
+    Each spec is ``(sparse_matrix, src_rank, via_rank)``. ``via_rank`` is the
+    rank that mediates the adjacency (e.g. up_adjacency-s through ``s+r``).
+    Edges accumulate the set of via-ranks seen across all specs; downstream
+    payload code blends colors when a pair appears in multiple specs.
+    """
     if not adjacency_specs:
         return None, {}, []
 
-    specs = sorted(
-        [(sp.coalesce() if sp is not None else None, int(rank))
-         for sp, rank in adjacency_specs if sp is not None],
-        key=lambda t: t[1],
-    )
+    normalized = []
+    for spec in adjacency_specs:
+        sp = spec[0]
+        if sp is None:
+            continue
+        src_rank = int(spec[1])
+        via_rank = int(spec[2]) if len(spec) >= 3 else src_rank
+        normalized.append((sp.coalesce(), src_rank, via_rank))
+    specs = sorted(normalized, key=lambda t: (t[1], t[2]))
     if not specs:
         return None, {}, []
 
-    raw_edges = []
+    # pair_via_ranks: (rank, (u, v)) -> set[int] of via-ranks
+    pair_via_ranks = {}
     layer_nodes = {}
-    for sp, rank in specs:
+    for sp, rank, via in specs:
         idx = sp.indices().numpy()
-        seen_pairs = set()
         for i in range(idx.shape[1]):
             src_orig = int(idx[0, i])
             tgt_orig = int(idx[1, i])
             if src_orig == tgt_orig:
                 continue
-            pair = (
-                (src_orig, tgt_orig)
-                if src_orig < tgt_orig
-                else (tgt_orig, src_orig)
-            )
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            u = _layered_node_id(rank, pair[0])
-            v = _layered_node_id(rank, pair[1])
-            raw_edges.append((u, v))
-            layer_nodes.setdefault(rank, {})[u] = pair[0]
-            layer_nodes.setdefault(rank, {})[v] = pair[1]
+            a, b = (src_orig, tgt_orig) if src_orig < tgt_orig else (tgt_orig, src_orig)
+            u = _layered_node_id(rank, a)
+            v = _layered_node_id(rank, b)
+            key = (rank, (u, v))
+            pair_via_ranks.setdefault(key, set()).add(via)
+            layer_nodes.setdefault(rank, {})[u] = a
+            layer_nodes.setdefault(rank, {})[v] = b
 
-    if not raw_edges:
+    if not pair_via_ranks:
         return None, {}, []
 
     degree = {}
-    for u, v in raw_edges:
+    for (_rank, (u, v)) in pair_via_ranks:
         degree[u] = degree.get(u, 0) + 1
         degree[v] = degree.get(v, 0) + 1
 
@@ -1437,15 +1617,14 @@ def build_layered_adjacency_networkx(
                 break
         G.add_node(n, layer=int(rank), original_id=int(orig))
 
-    seen_pairs = set()
-    for u, v in raw_edges:
+    for (_rank, (u, v)), via_set in pair_via_ranks.items():
         if u not in selected or v not in selected:
             continue
-        pair = (u, v) if u < v else (v, u)
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-        G.add_edge(u, v, kind="adjacency")
+        G.add_edge(
+            u, v,
+            kind="adjacency",
+            via_ranks=sorted(int(x) for x in via_set),
+        )
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1465,7 +1644,11 @@ def build_combined_layered_networkx(
     min_degree: int = 0,
     selected_by_rank=None,
 ):
-    """Build a layered graph from incidence (cross-rank) + adjacency (within-rank)."""
+    """Build a layered graph from incidence (cross-rank) + adjacency (within-rank).
+
+    Adjacency specs are 3-tuples ``(sparse, src_rank, via_rank)``; edges
+    accumulate the set of via-ranks observed across all selected adjacencies.
+    """
     specs_inc = sorted(
         [
             (sp.coalesce() if sp is not None else None, int(sr), int(tr))
@@ -1474,21 +1657,24 @@ def build_combined_layered_networkx(
         ],
         key=lambda t: t[1],
     )
-    specs_adj = sorted(
-        [
-            (sp.coalesce() if sp is not None else None, int(rank))
-            for sp, rank in adjacency_specs
-            if sp is not None
-        ],
-        key=lambda t: t[1],
-    )
+
+    normalized_adj = []
+    for spec in adjacency_specs:
+        sp = spec[0]
+        if sp is None:
+            continue
+        src_rank = int(spec[1])
+        via_rank = int(spec[2]) if len(spec) >= 3 else src_rank
+        normalized_adj.append((sp.coalesce(), src_rank, via_rank))
+    specs_adj = sorted(normalized_adj, key=lambda t: (t[1], t[2]))
+
     if not specs_inc and not specs_adj:
         return None, {}, []
 
-    raw_edges = []
+    raw_inc_edges = []  # list of (u, v)
+    adj_pair_via = {}  # (u, v) -> set[int]  with u<v lexicographically
     layer_nodes = {}
 
-    # Cross-rank incidence edges.
     for sp, sr, tr in specs_inc:
         idx = sp.indices().numpy()
         for i in range(idx.shape[1]):
@@ -1496,38 +1682,32 @@ def build_combined_layered_networkx(
             tgt_orig = int(idx[1, i])
             u = _layered_node_id(sr, src_orig)
             v = _layered_node_id(tr, tgt_orig)
-            raw_edges.append((u, v, "incidence"))
+            raw_inc_edges.append((u, v))
             layer_nodes.setdefault(sr, {})[u] = src_orig
             layer_nodes.setdefault(tr, {})[v] = tgt_orig
 
-    # Within-rank adjacency edges.
-    for sp, rank in specs_adj:
+    for sp, rank, via in specs_adj:
         idx = sp.indices().numpy()
-        seen_pairs = set()
         for i in range(idx.shape[1]):
             src_orig = int(idx[0, i])
             tgt_orig = int(idx[1, i])
             if src_orig == tgt_orig:
                 continue
-            pair = (
-                (src_orig, tgt_orig)
-                if src_orig < tgt_orig
-                else (tgt_orig, src_orig)
-            )
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            u = _layered_node_id(rank, pair[0])
-            v = _layered_node_id(rank, pair[1])
-            raw_edges.append((u, v, "adjacency"))
-            layer_nodes.setdefault(rank, {})[u] = pair[0]
-            layer_nodes.setdefault(rank, {})[v] = pair[1]
+            a, b = (src_orig, tgt_orig) if src_orig < tgt_orig else (tgt_orig, src_orig)
+            u = _layered_node_id(rank, a)
+            v = _layered_node_id(rank, b)
+            adj_pair_via.setdefault((u, v), set()).add(via)
+            layer_nodes.setdefault(rank, {})[u] = a
+            layer_nodes.setdefault(rank, {})[v] = b
 
-    if not raw_edges:
+    if not raw_inc_edges and not adj_pair_via:
         return None, {}, []
 
     degree = {}
-    for u, v, _ek in raw_edges:
+    for u, v in raw_inc_edges:
+        degree[u] = degree.get(u, 0) + 1
+        degree[v] = degree.get(v, 0) + 1
+    for (u, v) in adj_pair_via:
         degree[u] = degree.get(u, 0) + 1
         degree[v] = degree.get(v, 0) + 1
 
@@ -1565,15 +1745,24 @@ def build_combined_layered_networkx(
                 break
         G.add_node(n, layer=int(rank), original_id=int(orig))
 
-    seen_pairs = set()
-    for u, v, kind in raw_edges:
+    seen_inc = set()
+    for u, v in raw_inc_edges:
         if u not in selected or v not in selected:
             continue
         pair = (u, v) if u < v else (v, u)
-        if pair in seen_pairs:
+        if pair in seen_inc:
             continue
-        seen_pairs.add(pair)
-        G.add_edge(u, v, kind=kind)
+        seen_inc.add(pair)
+        G.add_edge(u, v, kind="incidence")
+
+    for (u, v), via_set in adj_pair_via.items():
+        if u not in selected or v not in selected:
+            continue
+        G.add_edge(
+            u, v,
+            kind="adjacency",
+            via_ranks=sorted(int(x) for x in via_set),
+        )
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1616,21 +1805,41 @@ def networkx_to_layered_d3_payload(
             "layer": rank,
         })
 
-    inc_stroke = "#888888"
     links_out = []
     for u, v, data in G.edges(data=True):
         kind = data.get("kind")
+        u_layer = int(G.nodes[u].get("layer", 0))
+        v_layer = int(G.nodes[v].get("layer", 0))
         if kind == "adjacency":
-            rk = int(G.nodes[u].get("layer", 0))
-            lc = rank_color(rk)
+            via_ranks = data.get("via_ranks")
+            if via_ranks:
+                colors = [rank_color(int(r)) for r in via_ranks]
+                lc = colors[0] if len(colors) == 1 else blend_hex(*colors)
+            else:
+                lc = rank_color(u_layer)
+            links_out.append({
+                "source": str(u),
+                "target": str(v),
+                "color": lc,
+                "kind": "adjacency",
+                "viaRanks": [int(r) for r in (via_ranks or [u_layer])],
+            })
         else:
-            lc = inc_stroke
-        links_out.append({
-            "source": str(u),
-            "target": str(v),
-            "color": lc,
-            "kind": kind or "incidence",
-        })
+            # Reversed gradient: near each endpoint we paint with the *other*
+            # endpoint's rank color (per user spec).
+            color_at_u = rank_color(v_layer)
+            color_at_v = rank_color(u_layer)
+            midpoint = blend_hex(color_at_u, color_at_v)
+            links_out.append({
+                "source": str(u),
+                "target": str(v),
+                "color": midpoint,
+                "colorStart": color_at_u,
+                "colorEnd": color_at_v,
+                "kind": kind or "incidence",
+                "srcRank": u_layer,
+                "tgtRank": v_layer,
+            })
 
     return {
         "graphType": "layered",
@@ -2254,80 +2463,61 @@ def _render_left_config(available_datasets):
 
 
 def _split_neighborhoods(available):
-    """Bucket available neighborhoods into the three picker boxes."""
+    """Bucket available neighborhoods into picker boxes."""
     graph_ids = [n["id"] for n in available if n["kind"] in ("graph", "hyperedges")]
     incidence = [n for n in available if n["kind"] == "incidence"]
     adjacency = [n for n in available if n["kind"] == "adjacency"]
+    tb_incidence = [n for n in available if n["kind"] == "tb_incidence"]
+    tb_adjacency = [n for n in available if n["kind"] == "tb_adjacency"]
     incidence.sort(key=lambda n: n.get("rank", 0))
     adjacency.sort(key=lambda n: n.get("rank", 0))
-    return graph_ids, incidence, adjacency
+    tb_incidence.sort(key=lambda n: (n.get("rank", 0), n["id"]))
+    tb_adjacency.sort(key=lambda n: (n.get("rank", 0), n["id"]))
+    return graph_ids, incidence, adjacency, tb_incidence, tb_adjacency
 
 
 def _render_neighborhood_picker():
-    """Three boxes (Graph radio / Incidence checklist / Adjacency radio)."""
+    """Picker showing all non-empty TopoBench neighborhoods on the loaded data."""
     st.subheader("Available neighborhoods")
     available = st.session_state.get("available_neighborhoods") or []
     if not available:
         st.info(
-            "Load a dataset to enable neighborhood selection. After loading, "
-            "you can pick one **Graph** entry, or any combination of "
-            "**Incidence** and **Adjacency** entries "
-            "(stacked bottom-to-top by rank)."
+            "Apply a lifting in the **Load graph** tab to compute "
+            "`r-direction_type-src_rank` neighborhoods."
         )
         return
-    
-    graph_ids, incidence_items, adjacency_items = _split_neighborhoods(
-        available
-    )
-    label_map = {n["id"]: n["label"] for n in available}
+
+    (_graph_ids, _incidence_items, _adjacency_items,
+     tb_incidence_items, tb_adjacency_items) = _split_neighborhoods(available)
     selected_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
 
-    # Make sure every picker widget key exists in state BEFORE the widgets
-    # render. _sync_picker_widget_state is idempotent and writes the values
-    # consistent with the current selected_neighborhood_ids -- this avoids
-    # ever falling back to st.radio's `index=` parameter on first render
-    # (which has been observed to fire spurious on_change callbacks that
-    # silently clobber the selection).
     _sync_picker_widget_state(selected_ids)
 
-    with st.container(border=True):
-        st.markdown("**Graph**")
-        if graph_ids:
-            options = ["(none)"] + graph_ids
-            st.radio(
-                "Graph view",
-                options=options,
-                format_func=lambda i: "(none)" if i == "(none)" else label_map.get(i, i),
-                key="graph_radio",
-                on_change=_on_graph_pick,
-                label_visibility="collapsed",
-            )
-        else:
-            st.caption("No graph / hyperedges neighborhood on this data.")
+    st.caption(
+        "Select any combination of `r-direction_type-src_rank` neighborhoods. "
+        "Incidence items render as bipartite edges between ranks; "
+        "adjacency items as within-rank edges."
+    )
 
-    with st.container(border=True):
-        st.markdown("**Incidence** (stacked bottom-to-top by rank)")
-        if incidence_items:
-            for item in incidence_items:
+    if tb_incidence_items:
+        with st.container(border=True):
+            st.markdown("**Incidence** (up / down)")
+            for item in tb_incidence_items:
                 st.checkbox(
                     item["label"],
-                    key=f"inc_{item['id']}_check",
-                    on_change=_on_incidence_toggle,
+                    key=f"tb_{item['id']}_check",
+                    on_change=_on_tb_toggle,
                 )
-        else:
-            st.caption("No incidence_k neighborhoods on this data.")
 
-    with st.container(border=True):
-        st.markdown("**Adjacency**")
-        if adjacency_items:
-            for item in adjacency_items:
+    if tb_adjacency_items:
+        with st.container(border=True):
+            st.markdown("**Adjacency** (up / down)")
+            for item in tb_adjacency_items:
                 st.checkbox(
                     item["label"],
-                    key=f"adj_{item['id']}_check",
-                    on_change=_on_adjacency_toggle,
+                    key=f"tb_{item['id']}_check",
+                    on_change=_on_tb_toggle,
                 )
-        else:
-            st.caption("No adjacency_k neighborhoods on this data.")
 
 
 def _sync_picker_widget_state(selected_ids):
@@ -2354,6 +2544,8 @@ def _sync_picker_widget_state(selected_ids):
             st.session_state[f"inc_{n['id']}_check"] = n["id"] in selected_set
         elif n["kind"] == "adjacency":
             st.session_state[f"adj_{n['id']}_check"] = n["id"] in selected_set
+        elif n["kind"] in ("tb_incidence", "tb_adjacency"):
+            st.session_state[f"tb_{n['id']}_check"] = n["id"] in selected_set
 
 
 def _on_graph_pick():
@@ -2375,33 +2567,44 @@ def _on_graph_pick():
     _commit_selection([pick])
 
 
+def _collect_layered_selection():
+    """Read every layered-kind checkbox and return the union of checked ids.
+
+    Combines basic incidence_k / adjacency_k checkboxes with the multi-hop
+    TopoBench checkboxes (``tb_incidence`` / ``tb_adjacency``).
+    """
+    available = st.session_state.get("available_neighborhoods") or []
+    layered_kinds = ("incidence", "adjacency", "tb_incidence", "tb_adjacency")
+    picked = []
+    for n in available:
+        kind = n["kind"]
+        if kind not in layered_kinds:
+            continue
+        if kind == "incidence":
+            key = f"inc_{n['id']}_check"
+        elif kind == "adjacency":
+            key = f"adj_{n['id']}_check"
+        else:
+            key = f"tb_{n['id']}_check"
+        if st.session_state.get(key):
+            picked.append(n["id"])
+    return picked
+
+
 def _on_incidence_toggle():
-    """Toggling an incidence checkbox keeps the union of checked
-    incidences and adjacencies."""
+    """Toggling any layered checkbox keeps the union of all checked items."""
     if st.session_state.get("data") is None:
         return
-    available = st.session_state.get("available_neighborhoods") or []
-    incidence_ids = [
-        n["id"] for n in available
-        if n["kind"] == "incidence"
-    ]
-    adjacency_ids = [
-        n["id"] for n in available
-        if n["kind"] == "adjacency"
-    ]
-    picked_inc = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
-    picked_adj = [i for i in adjacency_ids if st.session_state.get(f"adj_{i}_check")]
-    new_ids = picked_inc + picked_adj
+    new_ids = _collect_layered_selection()
     if not new_ids:
         graph_pick = st.session_state.get("graph_radio")
         if graph_pick and graph_pick != "(none)":
             _commit_selection([graph_pick])
             return
         prev = list(st.session_state.get("selected_neighborhood_ids") or [])
-        prev_layered = [p for p in prev if p in incidence_ids or p in adjacency_ids]
-        if not prev_layered:
+        if not prev:
             return
-        new_ids = [prev_layered[0]]
+        new_ids = [prev[0]]
     _commit_selection(new_ids)
 
 
@@ -2426,33 +2629,13 @@ def _on_metrics_option_change():
 
 
 def _on_adjacency_toggle():
-    """Toggling an adjacency checkbox keeps the union of checked
-    incidences and adjacencies."""
-    if st.session_state.get("data") is None:
-        return
-    available = st.session_state.get("available_neighborhoods") or []
-    adjacency_ids = [
-        n["id"] for n in available
-        if n["kind"] == "adjacency"
-    ]
-    incidence_ids = [
-        n["id"] for n in available
-        if n["kind"] == "incidence"
-    ]
-    picked_adj = [i for i in adjacency_ids if st.session_state.get(f"adj_{i}_check")]
-    picked_inc = [i for i in incidence_ids if st.session_state.get(f"inc_{i}_check")]
-    new_ids = picked_inc + picked_adj
-    if not new_ids:
-        graph_pick = st.session_state.get("graph_radio")
-        if graph_pick and graph_pick != "(none)":
-            _commit_selection([graph_pick])
-            return
-        prev = list(st.session_state.get("selected_neighborhood_ids") or [])
-        prev_layered = [p for p in prev if p in incidence_ids or p in adjacency_ids]
-        if not prev_layered:
-            return
-        new_ids = [prev_layered[0]]
-    _commit_selection(new_ids)
+    """Toggling an adjacency checkbox keeps the union of all layered checks."""
+    _on_incidence_toggle()
+
+
+def _on_tb_toggle():
+    """Toggling a TopoBench checkbox keeps the union of all layered checks."""
+    _on_incidence_toggle()
 
 
 def _commit_selection(new_ids):
@@ -2563,13 +2746,83 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         else "Lift: none (raw dataset)"
     )
 
-    incidence_ids = [
-        i for i in neigh_ids
-        if i.startswith("incidence_") and i != "incidence_hyperedges"
-    ]
-    adjacency_ids = [i for i in neigh_ids if i.startswith("adjacency_")]
+    def _classify_id(nid):
+        """Return classification tuple for an id.
+
+        - ``('incidence', src_sorted, tgt_sorted)`` for bipartite cross-rank edges.
+        - ``('adjacency', src_rank, via_rank)`` for within-rank edges, where
+          ``via_rank`` is the rank that mediates the adjacency
+          (basic ``adjacency_k`` → k+1; TB ``r-up_adjacency-s`` → s+r;
+          TB ``r-down_adjacency-s`` → s-r).
+        - ``(None, None, None)`` if unknown.
+        """
+        if nid.startswith("incidence_") and nid != "incidence_hyperedges":
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                return (None, None, None)
+            if k <= 0:
+                return (None, None, None)
+            return ("incidence", max(k - 1, 0), k)
+        if nid.startswith("adjacency_"):
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                return (None, None, None)
+            # Basic adjacency_k matches TopoBench up_adjacency-k, mediated by (k+1)-cells.
+            return ("adjacency", k, k + 1)
+        if "-" in nid:
+            try:
+                _r, _dir, _nt, _src = parse_neighborhood(nid)
+            except Exception:
+                return (None, None, None)
+            if _nt == "adjacency":
+                _via = _src + _r if _dir == "up" else _src - _r
+                return ("adjacency", _src, _via)
+            if _nt == "incidence":
+                _tgt = _neighborhood_target_rank(nid)
+                src_sorted, tgt_sorted = sorted((_src, _tgt))
+                return ("incidence", src_sorted, tgt_sorted)
+        return (None, None, None)
+
+    def _resolve_matrix(nid):
+        """Return a sparse COO matrix for an id (basic or TopoBench), or None."""
+        if nid.startswith("incidence_") and nid != "incidence_hyperedges":
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                return None
+            return incidence_rank_k_to_sparse(dset0, k)
+        if nid.startswith("adjacency_"):
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                return None
+            return adjacency_rank_k_to_sparse(dset0, k)
+        tb_cache = st.session_state.get("_topobench_neighborhoods") or {}
+        if nid in tb_cache:
+            sp = tb_cache[nid]
+            try:
+                _r, _dir, _nt, _src = parse_neighborhood(nid)
+            except Exception:
+                return sp
+            if _nt == "incidence" and _dir == "up":
+                # TopoBench's up_incidence-s yields a (N_tgt, N_src) matrix
+                # (transposed by select_neighborhoods_of_interest). For
+                # layered visualization we need (N_lower, N_higher), so
+                # transpose back to canonical (src × tgt) orientation.
+                try:
+                    return sp.transpose(0, 1).coalesce()
+                except Exception:
+                    return sp
+            return sp
+        return None
+
+    classified = [(nid, _classify_id(nid)) for nid in neigh_ids]
+    incidence_ids = [nid for nid, (k, _s, _t) in classified if k == "incidence"]
+    adjacency_ids = [nid for nid, (k, _s, _t) in classified if k == "adjacency"]
     non_layered_ids = [
-        i for i in neigh_ids if i not in incidence_ids and i not in adjacency_ids
+        nid for nid, (k, _s, _t) in classified if k is None
     ]
     use_combined = (
         len(incidence_ids) >= 1
@@ -2598,23 +2851,21 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         if use_combined:
             incidence_specs = []
             for nid in incidence_ids:
-                k = int(nid.split("_", 1)[1])
-                if k <= 0:
-                    continue
-                sp = incidence_rank_k_to_sparse(dset0, k)
+                kind, src, tgt = _classify_id(nid)
+                sp = _resolve_matrix(nid)
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                incidence_specs.append((sp, max(k - 1, 0), k))
+                incidence_specs.append((sp, src, tgt))
 
             adjacency_specs = []
             for nid in adjacency_ids:
-                k = int(nid.split("_", 1)[1])
-                sp = adjacency_rank_k_to_sparse(dset0, k)
+                kind, src, via = _classify_id(nid)
+                sp = _resolve_matrix(nid)
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                adjacency_specs.append((sp, k))
+                adjacency_specs.append((sp, src, via))
 
             if not incidence_specs or not adjacency_specs:
                 st.error(
@@ -2626,7 +2877,7 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
             ranks_chosen = sorted(
                 {sr for _, sr, _ in incidence_specs}
                 | {tr for _, _, tr in incidence_specs}
-                | {rank for _, rank in adjacency_specs}
+                | {rank for _, rank, _ in adjacency_specs}
             )
             G_load, nd_load, layers = build_combined_layered_networkx(
                 incidence_specs,
@@ -2646,8 +2897,14 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 )
                 return False
 
-            sorted_inc = sorted(incidence_ids, key=lambda x: int(x.split("_", 1)[1]))
-            sorted_adj = sorted(adjacency_ids, key=lambda x: int(x.split("_", 1)[1]))
+            sorted_inc = sorted(
+                incidence_ids,
+                key=lambda x: _classify_id(x)[1] if _classify_id(x)[1] is not None else 0,
+            )
+            sorted_adj = sorted(
+                adjacency_ids,
+                key=lambda x: _classify_id(x)[1] if _classify_id(x)[1] is not None else 0,
+            )
             vdesc = (
                 "Layered: "
                 + ", ".join(sorted_inc)
@@ -2669,17 +2926,15 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         elif use_layered:
             specs = []
             for nid in incidence_ids:
-                k = int(nid.split("_", 1)[1])
-                if k <= 0:
-                    continue
-                sp = incidence_rank_k_to_sparse(dset0, k)
+                kind, src, tgt = _classify_id(nid)
+                sp = _resolve_matrix(nid)
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                specs.append((sp, max(k - 1, 0), k))
+                specs.append((sp, src, tgt))
 
             if not specs:
-                st.error("No valid incidence_k (k>=1) selected for layered rendering.")
+                st.error("No valid incidence neighborhoods selected for layered rendering.")
                 return False
 
             ranks_chosen = sorted({sr for _, sr, _ in specs}
@@ -2710,8 +2965,10 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 )
                 return False
 
-            sorted_inc = sorted(incidence_ids,
-                                key=lambda x: int(x.split("_", 1)[1]))
+            sorted_inc = sorted(
+                incidence_ids,
+                key=lambda x: _classify_id(x)[1] if _classify_id(x)[1] is not None else 0,
+            )
             vdesc = "Layered: " + " | ".join(sorted_inc)
             payload = networkx_to_layered_d3_payload(
                 G_load,
@@ -2728,18 +2985,18 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
         elif use_layered_adj:
             specs = []
             for nid in adjacency_ids:
-                k = int(nid.split("_", 1)[1])
-                sp = adjacency_rank_k_to_sparse(dset0, k)
+                kind, src, via = _classify_id(nid)
+                sp = _resolve_matrix(nid)
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                specs.append((sp, k))
+                specs.append((sp, src, via))
 
             if not specs:
-                st.error("No valid adjacency_k selected for layered rendering.")
+                st.error("No valid adjacency neighborhoods selected for layered rendering.")
                 return False
 
-            ranks_chosen = sorted({rank for _, rank in specs})
+            ranks_chosen = sorted({rank for _, rank, _ in specs})
             G_load, nd_load, layers = build_layered_adjacency_networkx(
                 specs,
                 max_nodes=max_nodes,
@@ -2757,7 +3014,10 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 )
                 return False
 
-            sorted_adj = sorted(adjacency_ids, key=lambda x: int(x.split("_", 1)[1]))
+            sorted_adj = sorted(
+                adjacency_ids,
+                key=lambda x: _classify_id(x)[1] if _classify_id(x)[1] is not None else 0,
+            )
             vdesc = "Layered adjacency: " + " | ".join(sorted_adj)
             payload = networkx_to_layered_d3_payload(
                 G_load,
@@ -2801,6 +3061,17 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                     allowed_source = set(shared_by_rank.get(0, set()))
                     if shared_hyperedges is not None:
                         allowed_target = set(shared_hyperedges)
+                elif "-" in single_id:
+                    try:
+                        _r, _dir, _nt, _src = parse_neighborhood(single_id)
+                        allowed_source = set(shared_by_rank.get(_src, set()))
+                        if _nt == "adjacency":
+                            allowed_target = set(shared_by_rank.get(_src, set()))
+                        else:
+                            _tgt = _neighborhood_target_rank(single_id)
+                            allowed_target = set(shared_by_rank.get(_tgt, set()))
+                    except Exception:
+                        pass
 
             G_load, nd_load = sparse_to_networkx(
                 matrix,
@@ -2898,11 +3169,16 @@ def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name,
     )
     st.session_state["rank_labels"] = rank_labels_for_payload
 
+    st.session_state["_topobench_neighborhoods"] = (
+        compute_all_topobench_neighborhoods(dset0)
+    )
+
     available = enumerate_neighborhoods(dset0)
     st.session_state["available_neighborhoods"] = available
     if not available:
         st.error(
-            "No incidence/adjacency neighborhoods are available on this data."
+            "No non-empty neighborhoods are available on this data. "
+            "Apply a lifting to compute higher-order neighborhoods."
         )
         return False
 
@@ -3545,11 +3821,14 @@ def _render_sidebar_tab_selector(data_loaded):
 
 
 def _render_explore_tab():
-    """Post-load controls: 3D view, graph sample, and neighborhoods."""
+    """Post-load controls: neighborhoods (top), 3D view, and graph sample."""
     if st.session_state.get("data") is None:
         st.info("Load a graph from the **Load graph** tab to explore neighborhoods.")
         return
 
+    _render_neighborhood_picker()
+
+    st.divider()
     st.toggle(
         "3D layered view (orbit/zoom)",
         help=(
@@ -3563,9 +3842,6 @@ def _render_explore_tab():
     st.divider()
     st.subheader("Graph sample")
     _render_graph_sample_section()
-
-    st.divider()
-    _render_neighborhood_picker()
 
 
 def _render_metrics_tab():

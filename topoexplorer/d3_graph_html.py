@@ -280,14 +280,17 @@ def build_standalone_d3_html(
       }
 
       const nodeById = new Map(nodes.map(function(d) { return [String(d.id), d]; }));
-      const links = (payload.links || []).map(function(l) {
+      const links = (payload.links || []).map(function(l, idx) {
         const s = nodeById.get(String(l.source));
         const t = nodeById.get(String(l.target));
         return {
           source: s,
           target: t,
           color: l.color,
-          metrics: l.metrics
+          colorStart: l.colorStart,
+          colorEnd: l.colorEnd,
+          metrics: l.metrics,
+          _gradId: (l.colorStart && l.colorEnd) ? ("grad-link-" + idx) : null
         };
       }).filter(function(l) { return l.source && l.target; });
 
@@ -298,6 +301,20 @@ def build_standalone_d3_html(
       const svg = d3.select("#chart").append("svg")
         .attr("width", width).attr("height", height)
         .attr("viewBox", [0, 0, width, height]);
+
+      const defs = svg.append("defs");
+      const gradientLinks = links.filter(function(l) { return !!l._gradId; });
+      const gradients = defs.selectAll("linearGradient")
+        .data(gradientLinks)
+        .join("linearGradient")
+        .attr("id", function(d) { return d._gradId; })
+        .attr("gradientUnits", "userSpaceOnUse");
+      gradients.append("stop")
+        .attr("offset", "0%")
+        .attr("stop-color", function(d) { return d.colorStart || d.color || "#888"; });
+      gradients.append("stop")
+        .attr("offset", "100%")
+        .attr("stop-color", function(d) { return d.colorEnd || d.color || "#888"; });
 
       const g = svg.append("g");
       const zoom = d3.zoom()
@@ -370,7 +387,9 @@ def build_standalone_d3_html(
         .data(links)
         .join("line")
         .attr("class", "link")
-        .attr("stroke", function(d) { return d.color || "#888"; })
+        .attr("stroke", function(d) {
+          return d._gradId ? ("url(#" + d._gradId + ")") : (d.color || "#888");
+        })
         .attr("stroke-width", 1.2);
 
       link.append("title").text(function(d) { return edgeTooltip(d); });
@@ -409,6 +428,11 @@ def build_standalone_d3_html(
 
       simulation.on("tick", function() {
         link
+          .attr("x1", function(d) { return d.source.x; })
+          .attr("y1", function(d) { return d.source.y; })
+          .attr("x2", function(d) { return d.target.x; })
+          .attr("y2", function(d) { return d.target.y; });
+        gradients
           .attr("x1", function(d) { return d.source.x; })
           .attr("y1", function(d) { return d.source.y; })
           .attr("x2", function(d) { return d.target.x; })
