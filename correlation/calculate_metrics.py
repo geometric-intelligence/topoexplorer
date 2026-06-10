@@ -12,9 +12,14 @@ from omegaconf import OmegaConf
 from torch_geometric.utils import to_networkx
 from tqdm import tqdm
 
-from topobench.data.loaders.graph import TUDatasetLoader
-from topobench.data.preprocessor import PreProcessor
-from topobench.data.utils.utils import get_routes_from_neighborhoods
+try:
+    from topobench.data.loaders.graph import TUDatasetLoader
+    from topobench.data.preprocessor import PreProcessor
+    from topobench.data.utils.utils import get_routes_from_neighborhoods
+except (ImportError, RuntimeError):
+    TUDatasetLoader = None
+    PreProcessor = None
+    get_routes_from_neighborhoods = None
 from torch_geometric.data import Data
 
 # try:
@@ -365,19 +370,109 @@ def scorer(data_list, neighborhoods, routes, debug=False, enabled_metrics=None):
 
 
 def main():
+    print("Starting main execution...")
     parser = argparse.ArgumentParser(description="Expand complexes into Hasse graphs with timeout and checkpointing.")
-    parser.add_argument("--input_csv", type=str, default="correlation/wandb_runs/best_runs_summary.csv", help="Input summary CSV file.")
-    parser.add_argument("--output_csv", type=str, default="correlation/wandb_runs/best_runs_with_hasse_metrics.csv", help="Output final merged CSV file.")
-    parser.add_argument("--checkpoint_csv", type=str, default="correlation/wandb_runs/hasse_metrics_checkpoints.csv", help="Sidecar CSV for progress.")
+    parser.add_argument("--output_csv", type=str, default="correlation/runs_summaries/best_runs_with_hasse_metrics.csv", help="Output final merged CSV file.")
+    parser.add_argument("--checkpoint_csv", type=str, default="correlation/runs_summaries/hasse_metrics_checkpoints.csv", help="Sidecar CSV for progress.")
     parser.add_argument("--neighborhoods", type=str, default="[up_adjacency-0,up_adjacency-1,2-up_adjacency-0,down_adjacency-1,down_adjacency-2,2-down_adjacency-2,up_incidence-0,up_incidence-1,2-up_incidence-0,down_incidence-1,down_incidence-2,2-down_incidence-2]", help="Neighborhoods list.")
     parser.add_argument("--metrics", type=str, default="all_except_ricci", help="Comma-separated list of metrics or 'all', 'all_except_ricci'.")
     parser.add_argument("--debug", action="store_true", help="Print timing information.")
+    parser.add_argument("--force", action="store_true", help="Force recalculation of metrics even if in checkpoint.")
     args = parser.parse_args()
 
-    if not os.path.exists(args.input_csv):
-        print(f"Input CSV {args.input_csv} not found.")
+    # Define source paths
+    gnn_summary_path = "correlation/runs_summaries/best_runs_summary_gnn.csv"
+    hopse_m_summary_path = "correlation/runs_summaries/best_runs_summary_hopse_m.csv"
+    # Note: topotune is often in the main summary or can be extracted from aggregated
+    aggregated_path = "correlation/wandb_runs/aggregated_results.csv"
+
+    if not all(os.path.exists(p) for p in [gnn_summary_path, hopse_m_summary_path, aggregated_path]):
+        print("Required input CSV files not found.")
         return
-    summary_df = pd.read_csv(args.input_csv)
+
+    # 1. Construct the target summary_df
+    print("Restructuring summary data (5 lines per dataset, 3 for Mantra)...")
+    gnn_df = pd.read_csv(gnn_summary_path)
+    hopse_m_df = pd.read_csv(hopse_m_summary_path)
+    agg_df = pd.read_csv(aggregated_path)
+    
+    # Extract Topotune from aggregated if not in a separate summary
+    topotune_agg = agg_df[agg_df["model_type"] == "topotune"].copy()
+    
+    # Function to get best run from a group
+    def get_best_from_agg(group, suffix=None):
+        # Determine metric based on dataset name from first row
+        ds_name = group["dataset_name"].iloc[0]
+        if suffix:
+            metric_base, goal = f"f1-{suffix}", "max"
+        elif any(x in ds_name for x in ["Clearance_Hepatocyte_AZ", "Caco2_Wang"]):
+            metric_base, goal = "mae", "min"
+        elif "mantra" in ds_name:
+            metric_base, goal = "f1", "max"
+        else:
+            metric_base, goal = "accuracy", "max"
+            
+        val_col = f"summary.val_best_rerun/{metric_base}_mean"
+        test_col = f"summary.test_best_rerun/{metric_base}_mean"
+        test_std = f"summary.test_best_rerun/{metric_base}_std"
+        
+        if val_col not in group.columns: return None
+        
+        sub = group.dropna(subset=[val_col]).copy()
+        if sub.empty: return None
+        
+        best_idx = sub[val_col].idxmin() if goal == "min" else sub[val_col].idxmax()
+        row = sub.loc[best_idx].copy()
+        # Clean up score names for consistency
+        row["score_name"] = "f1" if "f1" in metric_base else metric_base
+        row["score"], row["score_std"] = row[test_col], row[test_std]
+        row["val_score"] = row[val_col]
+        return row
+
+    topotune_rows = []
+    for (ds, dom), group in topotune_agg.groupby(["dataset_name", "config.model.model_domain"], dropna=False):
+        # Mantra is simplicial only
+        if "mantra" in ds.lower() and dom != "simplicial": continue
+        if dom not in ["cell", "simplicial"]: continue
+        
+        if "betti_numbers" in ds:
+            for suffix in ["1", "2"]:
+                best_row = get_best_from_agg(group, suffix=suffix)
+                if best_row is not None:
+                    best_row["dataset_name"] = f"mantra_betti_number_{suffix}"
+                    best_row["model_category"] = f"topotune_{dom}"
+                    topotune_rows.append(best_row)
+        else:
+            best_row = get_best_from_agg(group)
+            if best_row is not None:
+                best_row["model_category"] = f"topotune_{dom}"
+                topotune_rows.append(best_row)
+    
+    topotune_df = pd.DataFrame(topotune_rows)
+    
+    # Combine everything
+    # We want: Best GNN (1), Topotune (2), Hopse_m (2)
+    summary_df = pd.concat([gnn_df, topotune_df, hopse_m_df], ignore_index=True)
+    
+    # Drop cocitation/ZINC as in download_runs.py
+    summary_df = summary_df[~summary_df["dataset_name"].str.contains("cocitation|ZINC", case=False, regex=True)]
+    
+    # Ensure 'domain' is correctly mapped for metric lookup
+    # 1. Start from config.model.model_domain if available
+    if "config.model.model_domain" in summary_df.columns:
+        summary_df["domain"] = summary_df["config.model.model_domain"]
+    else:
+        summary_df["domain"] = "cell"
+
+    # 2. Refine mapping
+    summary_df["is_mantra_flag"] = summary_df["dataset_name"].str.contains("mantra", case=False)
+    # Mantra always simplicial
+    summary_df.loc[summary_df["is_mantra_flag"], "domain"] = "simplicial"
+    # Others: anything not simplicial is cell
+    summary_df.loc[(~summary_df["is_mantra_flag"]) & (summary_df["domain"] != "simplicial"), "domain"] = "cell"
+    summary_df["domain"] = summary_df["domain"].fillna("cell")
+    summary_df = summary_df.drop(columns=["is_mantra_flag"])
+
     dataset_names = summary_df["dataset_name"].unique().tolist()
 
     nbhd_str = args.neighborhoods.strip().strip("[]")
@@ -397,93 +492,140 @@ def main():
     # Checkpoint loading
     if os.path.exists(args.checkpoint_csv):
         checkpoint_df = pd.read_csv(args.checkpoint_csv)
+        if "domain" not in checkpoint_df.columns:
+            checkpoint_df["domain"] = "cell"
+        checkpoint_df["domain"] = checkpoint_df["domain"].fillna("cell")
+
+        # Reorder columns to make domain the second one
+        cols = checkpoint_df.columns.tolist()
+        if "domain" in cols:
+            cols.remove("domain")
+            cols.insert(1, "domain")
+            checkpoint_df = checkpoint_df[cols]
+
         processed_datasets = set(checkpoint_df["dataset_name"].unique())
         print(f"Resuming from checkpoint. Already processed: {processed_datasets}")
     else:
-        checkpoint_df = pd.DataFrame(columns=["dataset_name"])
+        checkpoint_df = pd.DataFrame(columns=["dataset_name", "domain"])
         processed_datasets = set()
 
-    transforms_config = OmegaConf.create({
-        "cycle_lifting": {"transform_type": "lifting", "transform_name": "CellCycleLifting", "complex_dim": 2, "neighborhoods": neighborhoods}
-    })
-
     # Identify unique graph names for Mantra (to avoid redundant scoring)
-    processed_mantra = False
+    processed_mantra = {"cell": False, "simplicial": False}
+    if not checkpoint_df.empty:
+        for d in ["cell", "simplicial"]:
+            if ((checkpoint_df["domain"] == d) & (checkpoint_df["dataset_name"].str.contains("mantra", case=False))).any():
+                processed_mantra[d] = True
+                print(f"Mantra already processed for domain: {d}")
 
-    for data_name in dataset_names:
-        if data_name in processed_datasets:
-            print(f"Skipping already processed dataset: {data_name}")
-            continue
-
-        # Check for Mantra redundancy
+    for data_name in tqdm(dataset_names, desc="Datasets"):
+        # Get domains present for this dataset in summary_df
+        relevant_rows = summary_df[summary_df["dataset_name"] == data_name]
         is_mantra = "mantra" in data_name.lower()
-        if is_mantra and processed_mantra:
-            print(f"Skipping redundant Mantra dataset (topology already scored): {data_name}")
-            # We should still add it to processed_datasets or similar if needed, 
-            # but usually the checkpoint_df will handle it later if we copy the row.
-            continue
-
-        print(f"\nProcessing dataset: {data_name}")
-        # Dispatch loader
-        loader_kwargs = {"data_name": data_name, "data_dir": "./datasets/graph/TUDataset"}
-        if data_name in ["BBB_Martins", "CYP3A4_Veith", "Caco2_Wang", "Clearance_Hepatocyte_AZ", "PAMPA_NCATS", "HIA_Hou", "Pgp_Broccatelli", "Bioavailability_Ma", "CYP1A2_Veith", "CYP2C19_Veith", "CYP2D6_Veith", "CYP2C9_Veith", "CYP2C9_Substrate_CarbonMangels", "CYP2D6_Substrate_CarbonMangels", "CYP3A4_Substrate_CarbonMangels", "Lipophilicity_AstraZeneca", "Solubility_AqSolDB", "HydrationFreeEnergy_FreeSolv", "PPBR_AZ", "VDss_Lombardo", "Half_Life_Obach", "Clearance_Microsome_AZ"]:
-            from topobench.data.loaders.graph.adme_datasets import ADMEDatasetLoader
-            loader_class, data_dir = ADMEDatasetLoader, "./datasets/graph/ADME"
-            loader_kwargs["data_dir"] = data_dir
-        elif is_mantra:
-            from topobench.data.loaders.graph.mantra_dataset import MantraSimplicialDatasetLoader
-            loader_class, data_dir = MantraSimplicialDatasetLoader, "./datasets/graph/MANTRA"
-            loader_kwargs["data_dir"] = data_dir
-            loader_kwargs["manifold_dim"] = 2 
-            loader_kwargs["version"] = "v0.0.5"
-            # Extract task variable from name (e.g., mantra_betti_number_1 -> betti_numbers)
-            if "betti" in data_name:
-                loader_kwargs["task_variable"] = "betti_numbers"
-            elif "name" in data_name:
-                loader_kwargs["task_variable"] = "name"
-            elif "orientation" in data_name:
-                loader_kwargs["task_variable"] = "orientation"
-            else:
-                loader_kwargs["task_variable"] = "betti_numbers"
+        
+        # Determine target domains: map anything not 'simplicial' to 'cell'
+        if "config.model.model_domain" in relevant_rows.columns:
+            raw_domains = relevant_rows["config.model.model_domain"].unique().tolist()
         else:
-            from topobench.data.loaders.graph.tu_datasets import TUDatasetLoader
-            loader_class, data_dir = TUDatasetLoader, "./datasets/graph/TUDataset"
+            raw_domains = ["cell"]
+        
+        target_domains = set()
+        for d in raw_domains:
+            if d == "simplicial":
+                target_domains.add("simplicial")
+            else:
+                # For Mantra, we skip 'cell' domain since it's naturally simplicial
+                if not is_mantra:
+                    target_domains.add("cell")
+        
+        # If Mantra somehow has no simplicial rows but is present, ensure we only target simplicial
+        if is_mantra:
+            target_domains = {"simplicial"}
 
-        try:
-            dataset, dataset_dir = loader_class(OmegaConf.create(loader_kwargs)).load()
-            preprocessor = PreProcessor(dataset=dataset, data_dir=dataset_dir, transforms_config=transforms_config)
+        for domain in target_domains:
+            # Check if (data_name, domain) already in checkpoint_df
+            if not args.force and not checkpoint_df.empty and \
+               ((checkpoint_df["dataset_name"] == data_name) & (checkpoint_df["domain"] == domain)).any():
+                continue
+
+            # Check for Mantra redundancy per domain
+            if not args.force and is_mantra and processed_mantra.get(domain):
+                continue
+
+            print(f"\nProcessing {data_name} (domain: {domain})...")
             
-            dataset_metrics = scorer(preprocessor, neighborhoods, routes, args.debug, enabled_metrics)
-            
-            # Save results (for Mantra, copy to all variants)
-            names_to_save = [data_name]
+            # Setup lifting: For Mantra, we skip the lifting transform because it's already a simplicial complex
             if is_mantra:
-                names_to_save = [n for n in dataset_names if "mantra" in n.lower()]
-                processed_mantra = True
+                transforms_config = None 
+            elif domain == "cell":
+                transforms_config = OmegaConf.create({
+                    "cycle_lifting": {"transform_type": "lifting", "transform_name": "CellCycleLifting", "complex_dim": 2, "neighborhoods": neighborhoods}
+                })
+            else:
+                transforms_config = OmegaConf.create({
+                    "clique_lifting": {"transform_type": "lifting", "transform_name": "SimplicialCliqueLifting", "complex_dim": 2, "neighborhoods": neighborhoods}
+                })
 
-            for name in names_to_save:
-                row = {"dataset_name": name}
-                for nbhd, m_data in dataset_metrics.items():
-                    for m_name, stats in m_data.items():
-                        for stype, val in stats.items():
-                            row[f"{nbhd}_{m_name}_{stype}"] = val
+            # Dispatch loader
+            loader_kwargs = {"data_name": data_name, "data_dir": "./datasets/graph/TUDataset"}
+            if data_name in ["BBB_Martins", "CYP3A4_Veith", "Caco2_Wang", "Clearance_Hepatocyte_AZ", "PAMPA_NCATS", "HIA_Hou", "Pgp_Broccatelli", "Bioavailability_Ma", "CYP1A2_Veith", "CYP2C19_Veith", "CYP2D6_Veith", "CYP2C9_Veith", "CYP2C9_Substrate_CarbonMangels", "CYP2D6_Substrate_CarbonMangels", "CYP3A4_Substrate_CarbonMangels", "Lipophilicity_AstraZeneca", "Solubility_AqSolDB", "HydrationFreeEnergy_FreeSolv", "PPBR_AZ", "VDss_Lombardo", "Half_Life_Obach", "Clearance_Microsome_AZ"]:
+                from topobench.data.loaders.graph.adme_datasets import ADMEDatasetLoader
+                loader_class, data_dir = ADMEDatasetLoader, "./datasets/graph/ADME"
+                loader_kwargs["data_dir"] = data_dir
+            elif is_mantra:
+                from topobench.data.loaders.graph.mantra_dataset import MantraSimplicialDatasetLoader
+                loader_class, data_dir = MantraSimplicialDatasetLoader, "./datasets/graph/MANTRA"
+                loader_kwargs["data_dir"] = data_dir
+                loader_kwargs["manifold_dim"] = 2 
+                loader_kwargs["version"] = "v0.0.5"
+                # Extract task variable from name (e.g., mantra_betti_number_1 -> betti_numbers)
+                if "betti" in data_name:
+                    loader_kwargs["task_variable"] = "betti_numbers"
+                elif "name" in data_name:
+                    loader_kwargs["task_variable"] = "name"
+                elif "orientation" in data_name:
+                    loader_kwargs["task_variable"] = "orientation"
+                else:
+                    loader_kwargs["task_variable"] = "betti_numbers"
+            else:
+                from topobench.data.loaders.graph.tu_datasets import TUDatasetLoader
+                loader_class, data_dir = TUDatasetLoader, "./datasets/graph/TUDataset"
+
+            try:
+                dataset, dataset_dir = loader_class(OmegaConf.create(loader_kwargs)).load()
+                preprocessor = PreProcessor(dataset=dataset, data_dir=dataset_dir, transforms_config=transforms_config)
                 
-                new_row_df = pd.DataFrame([row])
-                # Filter out existing entries for this name to avoid duplicates
-                checkpoint_df = checkpoint_df[checkpoint_df["dataset_name"] != name]
-                checkpoint_df = pd.concat([checkpoint_df, new_row_df], ignore_index=True)
-            
-            checkpoint_df.to_csv(args.checkpoint_csv, index=False)
-            print(f"Dataset result saved for: {names_to_save}")
-            
-        except Exception as e:
-            print(f"Error processing dataset {data_name}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+                dataset_metrics = scorer(preprocessor, neighborhoods, routes, args.debug, enabled_metrics)
+                
+                # Save results (for Mantra, copy to all variants in the same domain)
+                names_to_save = [data_name]
+                if is_mantra:
+                    names_to_save = [n for n in dataset_names if "mantra" in n.lower()]
+                    processed_mantra[domain] = True
+
+                for name in names_to_save:
+                    row = {"dataset_name": name, "domain": domain}
+                    for nbhd, m_data in dataset_metrics.items():
+                        for m_name, stats in m_data.items():
+                            for stype, val in stats.items():
+                                row[f"{nbhd}_{m_name}_{stype}"] = val
+                    
+                    new_row_df = pd.DataFrame([row])
+                    # Filter out existing entries for this name and domain to avoid duplicates
+                    if not checkpoint_df.empty:
+                        checkpoint_df = checkpoint_df[~((checkpoint_df["dataset_name"] == name) & (checkpoint_df["domain"] == domain))]
+                    checkpoint_df = pd.concat([checkpoint_df, new_row_df], ignore_index=True)
+                
+                checkpoint_df.to_csv(args.checkpoint_csv, index=False)
+                print(f"Dataset result saved for: {names_to_save} ({domain})")
+                
+            except Exception as e:
+                print(f"Error processing dataset {data_name} ({domain}): {e}")
+                import traceback
+                traceback.print_exc()
+                continue
 
     # Final Merge
-    merged_df = pd.merge(summary_df, checkpoint_df, on="dataset_name", how="left")
+    merged_df = pd.merge(summary_df, checkpoint_df, on=["dataset_name", "domain"], how="left")
     merged_df.to_csv(args.output_csv, index=False)
     print(f"\nFinal merged results saved to {args.output_csv}")
 

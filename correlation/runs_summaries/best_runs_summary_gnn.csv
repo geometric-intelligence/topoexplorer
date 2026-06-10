@@ -1,0 +1,13 @@
+dataset_name,model_type,model_category,score_name,score,score_std,val_score,run_count,config.model.model_domain,config.model.tune_gnn,config.model.backbone.neighborhoods,config.model.backbone.GNN.num_layers,config.model.feature_encoder.out_channels,config.model.feature_encoder.proj_dropout,config.optimizer.parameters.lr,config.optimizer.parameters.weight_decay,config.dataset.dataloader_params.batch_size
+BBB_Martins,gin,gnn_baseline_graph,accuracy,0.8287356350156996,0.00919494259478378,0.8837438450919257,45,graph,,,,256.0,0.25,0.001,0.0001,256.0
+CYP3A4_Veith,gat,gnn_baseline_graph,accuracy,0.7760295629501343,0.008497286717800836,0.7914030803574457,45,graph,,,,256.0,0.5,0.001,0.0001,128.0
+Caco2_Wang,gat,gnn_baseline_graph,mae,1.104136468304528,0.1495468144098443,1.0750553687413533,45,graph,,,,128.0,0.25,0.01,0.0001,128.0
+Clearance_Hepatocyte_AZ,gat,gnn_baseline_graph,mae,36.614068264431424,2.396942435783506,35.08010423448351,45,graph,,,,128.0,0.25,0.01,0.0001,128.0
+MUTAG,gat,gnn_baseline_graph,accuracy,0.7862884177101983,0.09362094288828166,0.8401891337500678,45,graph,,,,128.0,0.25,0.001,0.0,256.0
+NCI1,gat,gnn_baseline_graph,accuracy,0.7305447578430175,0.015500506813577487,0.7422698219617208,45,graph,,,,128.0,0.25,0.01,0.0001,128.0
+NCI109,gat,gnn_baseline_graph,accuracy,0.721910293896993,0.016415975038496476,0.7388511644469367,45,graph,,,,128.0,0.25,0.01,0.0,128.0
+PROTEINS,gcn,gnn_baseline_graph,accuracy,0.7449621677398681,0.02744554609362996,0.7619504438506233,45,graph,,,,128.0,0.5,0.01,0.0,128.0
+mantra_betti_number_1,gin,gnn_baseline_graph,f1,0.8720348238945007,0.0261867499389183,0.8810177458657159,45,graph,,,,128.0,0.25,0.001,0.0001,128.0
+mantra_betti_number_2,gin,gnn_baseline_graph,f1,0.519088351726532,0.04101951951835318,0.5188062204254998,45,graph,,,,256.0,0.25,0.001,0.0001,128.0
+mantra_name,gin,gnn_baseline_graph,f1,0.7641712082756891,0.009831432634059466,0.7653505537245009,45,graph,,,,128.0,0.25,0.001,0.0001,256.0
+mantra_orientation,gin,gnn_baseline_graph,f1,0.5629333986176385,0.004713264575613854,0.5591530640920003,45,graph,,,,128.0,0.5,0.001,0.0001,256.0

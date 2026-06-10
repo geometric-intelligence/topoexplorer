@@ -4,6 +4,7 @@ from scipy.stats import spearmanr
 import statsmodels.stats.multitest as mt
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
 
 def normalize_score(row, baseline_dict):
     ds = row['dataset_name']
@@ -49,9 +50,9 @@ def run_correlations(data_subset, name, metric_cols):
         
     print(f"Exclusion summary for {name}:")
     print(f"Dropped {len(dropped_few_samples)} metrics due to < 5 valid samples:")
-    print(dropped_few_samples)
+    # print(dropped_few_samples) # Too verbose
     print(f"Dropped {len(dropped_zero_variance)} metrics due to zero variance:")
-    print(dropped_zero_variance)
+    # print(dropped_zero_variance) # Too verbose
     print("")
     
     res_df = pd.DataFrame(results).dropna()
@@ -95,8 +96,15 @@ def plot_top_metric(res_df, data_subset, name):
     plt.savefig(f"{name}_plot.png", dpi=300)
     plt.close()
 
-df = pd.read_csv('correlation/wandb_runs/best_runs_with_hasse_metrics.csv')
+# Load data
+input_file = 'correlation/runs_summaries/best_runs_with_hasse_metrics.csv'
+if not os.path.exists(input_file):
+    print(f"Error: {input_file} not found.")
+    exit(1)
 
+df = pd.read_csv(input_file)
+
+# Calculate baselines
 baseline_models = ['gin', 'gat', 'gcn']
 baselines = df[df['model_type'].isin(baseline_models)]
 
@@ -109,23 +117,53 @@ for dataset, group in baselines.groupby('dataset_name'):
         best_score = group['score'].max()
     baseline_dict[dataset] = {'score': best_score, 'metric': score_name}
 
-topotune = df[df['model_type'] == 'topotune'].copy()
-topotune['normalized_score'] = topotune.apply(lambda row: normalize_score(row, baseline_dict), axis=1)
-topotune = topotune.dropna(subset=['normalized_score'])
-
-exclude_cols = ['dataset_name', 'model_type', 'model_category', 'config', 'score', 'score_std', 'val_score', 'run_count', 'normalized_score']
-metric_cols = [c for c in df.columns if c not in exclude_cols and ('up_' in c or 'down_' in c or 'incidence_' in c or 'adjacency' in c)]
+# Identification of metric columns
+exclude_cols = [
+    'dataset_name', 'model_type', 'model_category', 'config', 'score', 
+    'score_std', 'val_score', 'run_count', 'normalized_score', 'domain', 
+    'score_name'
+]
+# Filter columns that are likely Hasse metrics
+metric_cols = [c for c in df.columns if c not in exclude_cols and any(x in c for x in ['up_', 'down_', 'incidence_', 'adjacency'])]
 mean_metric_cols = [c for c in metric_cols if c.endswith('_mean')]
 
-subsets = [
-    (topotune[topotune['config.model.model_domain'].isin(['cell', 'simplicial'])], "correlation/correlation_results/combined_cell_simplicial", metric_cols),
-    (topotune[topotune['config.model.model_domain'] == 'cell'], "correlation/correlation_results/cell_only", metric_cols),
-    (topotune[topotune['config.model.model_domain'] == 'simplicial'], "correlation/correlation_results/simplicial_only", metric_cols),
-    (topotune[topotune['config.model.model_domain'].isin(['cell', 'simplicial'])], "correlation/correlation_results/combined_cell_simplicial_mean_only", mean_metric_cols),
-    (topotune[topotune['config.model.model_domain'] == 'cell'], "correlation/correlation_results/cell_only_mean_only", mean_metric_cols),
-    (topotune[topotune['config.model.model_domain'] == 'simplicial'], "correlation/correlation_results/simplicial_only_mean_only", mean_metric_cols)
-]
+# Models to study
+models_to_study = ['topotune', 'hopse_m']
 
-for data_subset, path_name, columns in subsets:
-    res = run_correlations(data_subset, path_name, columns)
-    plot_top_metric(res, data_subset, path_name)
+for model in models_to_study:
+    print(f"\n{'='*40}")
+    print(f"Analyzing model: {model}")
+    print(f"{'='*40}\n")
+    
+    model_df = df[df['model_type'] == model].copy()
+    if model_df.empty:
+        print(f"No data found for model: {model}")
+        continue
+        
+    model_df['normalized_score'] = model_df.apply(lambda row: normalize_score(row, baseline_dict), axis=1)
+    model_df = model_df.dropna(subset=['normalized_score'])
+    
+    if model_df.empty:
+        print(f"No valid normalized scores for model: {model}")
+        continue
+
+    output_dir = f"correlation/spearman_{model}_results"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    subsets = [
+        (model_df[model_df['config.model.model_domain'].isin(['cell', 'simplicial'])], f"{output_dir}/combined_cell_simplicial", metric_cols),
+        (model_df[model_df['config.model.model_domain'] == 'cell'], f"{output_dir}/cell_only", metric_cols),
+        (model_df[model_df['config.model.model_domain'] == 'simplicial'], f"{output_dir}/simplicial_only", metric_cols),
+        (model_df[model_df['config.model.model_domain'].isin(['cell', 'simplicial'])], f"{output_dir}/combined_cell_simplicial_mean_only", mean_metric_cols),
+        (model_df[model_df['config.model.model_domain'] == 'cell'], f"{output_dir}/cell_only_mean_only", mean_metric_cols),
+        (model_df[model_df['config.model.model_domain'] == 'simplicial'], f"{output_dir}/simplicial_only_mean_only", mean_metric_cols)
+    ]
+
+    for data_subset, path_name, columns in subsets:
+        if data_subset.empty:
+            print(f"Subset empty for {path_name}, skipping.")
+            continue
+        res = run_correlations(data_subset, path_name, columns)
+        plot_top_metric(res, data_subset, path_name)
+
+print("\nSpearman correlation study completed.")
