@@ -173,7 +173,7 @@ def extract_dataset_metadata(domain, dataset_name):
 # ============================================================================
 
 st.set_page_config(
-    page_title="Hypergraph Neighborhood Explorer",
+    page_title="TopoExplorer",
     page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -190,12 +190,19 @@ st.markdown(
         max-width: {_SIDEBAR_TARGET_WIDTH_PX}px;
         width: {_SIDEBAR_TARGET_WIDTH_PX}px;
     }}
-    /* Main canvas: light margins; graph block height set by components.html only. */
+    /* Main canvas: tight top margin so headers/content sit near the top border.
+       The fixed header is made transparent (below) so top-of-page banners and
+       the load spinner remain visible despite the small padding. */
     [data-testid="stMainBlockContainer"], .block-container {{
-        padding-top: 0.5rem;
+        padding-top: 1rem;
         padding-left: 1.5rem;
         padding-right: 1.5rem;
         max-width: 100%;
+    }}
+    /* Transparent, zero-height header so it never covers top-of-page content. */
+    [data-testid="stHeader"] {{
+        background: rgba(0, 0, 0, 0);
+        height: 0;
     }}
     [data-testid="stSidebar"] {{
         position: relative;
@@ -776,6 +783,25 @@ def enumerate_neighborhoods(data):
         where ``kind`` is ``tb_incidence`` or ``tb_adjacency``.
     """
     out = []
+
+    # Base structures: the plain graph (pairwise adjacency) and, when present,
+    # the node x hyperedge incidence. These let the user view only the
+    # underlying (hyper)graph without any higher-order neighborhood overlay.
+    if edge_index_to_sparse_adj(data) is not None:
+        out.append({
+            "id": "graph",
+            "label": "Graph — pairwise adjacency",
+            "kind": "graph",
+            "rank": 0,
+        })
+    if incidence_to_sparse_incidence(data) is not None:
+        out.append({
+            "id": "hyperedges",
+            "label": "Hyperedges — node × hyperedge incidence",
+            "kind": "hyperedges",
+            "rank": 0,
+        })
+
     tb_cache = st.session_state.get("_topobench_neighborhoods") or {}
     type_order = ["up_incidence", "down_incidence", "up_adjacency", "down_adjacency"]
     for ntype in type_order:
@@ -2476,13 +2502,16 @@ def _split_neighborhoods(available):
     return graph_ids, incidence, adjacency, tb_incidence, tb_adjacency
 
 
+_ADD_PLACEHOLDER = "➕ Add neighborhood…"
+
+
 def _render_neighborhood_picker():
     """Picker showing all non-empty TopoBench neighborhoods on the loaded data."""
     st.subheader("Available neighborhoods")
     available = st.session_state.get("available_neighborhoods") or []
     if not available:
         st.info(
-            "Apply a lifting in the **Load graph** tab to compute "
+            "Apply a lifting in the **Load** tab to compute "
             "`r-direction_type-src_rank` neighborhoods."
         )
         return
@@ -2491,33 +2520,89 @@ def _render_neighborhood_picker():
      tb_incidence_items, tb_adjacency_items) = _split_neighborhoods(available)
     selected_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
 
-    _sync_picker_widget_state(selected_ids)
+    base_items = [n for n in available if n["kind"] in ("graph", "hyperedges")]
+    _render_base_group(base_items, selected_ids)
+    _render_nbhd_group("Incidence", "inc", tb_incidence_items, selected_ids)
+    _render_nbhd_group("Adjacency", "adj", tb_adjacency_items, selected_ids)
 
-    st.caption(
-        "Select any combination of `r-direction_type-src_rank` neighborhoods. "
-        "Incidence items render as bipartite edges between ranks; "
-        "adjacency items as within-rank edges."
-    )
 
-    if tb_incidence_items:
-        with st.container(border=True):
-            st.markdown("**Incidence** (up / down)")
-            for item in tb_incidence_items:
-                st.checkbox(
-                    item["label"],
-                    key=f"tb_{item['id']}_check",
-                    on_change=_on_tb_toggle,
-                )
+def _render_base_group(items, selected_ids):
+    """Render the base-structure view options (graph / hyperedges).
 
-    if tb_adjacency_items:
-        with st.container(border=True):
-            st.markdown("**Adjacency** (up / down)")
-            for item in tb_adjacency_items:
-                st.checkbox(
-                    item["label"],
-                    key=f"tb_{item['id']}_check",
-                    on_change=_on_tb_toggle,
-                )
+    Picking one shows only that structure (exclusive selection), which is how a
+    user views the plain (hyper)graph without any neighborhood overlay.
+    """
+    if not items:
+        return
+    selected_set = set(selected_ids)
+    with st.container(border=True):
+        st.markdown("**Base structure**")
+        for item in items:
+            active = selected_set == {item["id"]}
+            st.button(
+                item["label"],
+                key=f"base_{item['id']}_btn",
+                help="Show only this structure",
+                on_click=_on_base_pick,
+                args=(item["id"],),
+                type="primary" if active else "secondary",
+                width="stretch",
+            )
+
+
+def _render_nbhd_group(title, prefix, items, selected_ids):
+    """Render one neighborhood group: selected tags + an add-only dropdown.
+
+    ``items`` are the available neighborhoods of this group (each a dict with
+    ``id``/``label``). Selected items appear as removable badges above a
+    dropdown that lists only the not-yet-selected options. Empty groups show a
+    short note instead of a dropdown.
+    """
+    selected_set = set(selected_ids)
+    with st.container(border=True):
+        st.markdown(f"**{title}** (up / down)")
+
+        if not items:
+            st.caption(f"No {title.lower()} neighborhoods on this data")
+            return
+
+        labels = {it["id"]: it["label"] for it in items}
+        chosen = [it["id"] for it in items if it["id"] in selected_set]
+
+        # Selected options as removable tag badges (above the dropdown).
+        if chosen:
+            try:
+                tag_row = st.container(horizontal=True)
+            except TypeError:  # older Streamlit without horizontal containers
+                tag_row = st.container()
+            with tag_row:
+                for nb_id in chosen:
+                    st.button(
+                        f"{nb_id}  ✕",
+                        key=f"rm_{nb_id}",
+                        help=labels.get(nb_id, nb_id),
+                        on_click=_on_nbhd_remove,
+                        args=(nb_id,),
+                        width="content",
+                    )
+
+        # Add-only dropdown listing options not yet selected.
+        remaining = [it["id"] for it in items if it["id"] not in selected_set]
+        add_key = f"{prefix}_add_select"
+        if remaining:
+            if st.session_state.get(add_key) not in remaining:
+                st.session_state[add_key] = _ADD_PLACEHOLDER
+            st.selectbox(
+                f"Add {title.lower()} neighborhood",
+                options=[_ADD_PLACEHOLDER] + remaining,
+                format_func=lambda v: _ADD_PLACEHOLDER if v == _ADD_PLACEHOLDER else labels.get(v, v),
+                key=add_key,
+                on_change=_on_nbhd_add,
+                args=(prefix,),
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("All options selected")
 
 
 def _sync_picker_widget_state(selected_ids):
@@ -2636,6 +2721,45 @@ def _on_adjacency_toggle():
 def _on_tb_toggle():
     """Toggling a TopoBench checkbox keeps the union of all layered checks."""
     _on_incidence_toggle()
+
+
+_BASE_IDS = ("graph", "hyperedges")
+
+
+def _on_base_pick(base_id):
+    """Select a base structure exclusively (view only the plain (hyper)graph)."""
+    if st.session_state.get("data") is None:
+        return
+    _commit_selection([base_id])
+
+
+def _on_nbhd_add(prefix):
+    """Add the neighborhood chosen in a group's add-dropdown to the selection."""
+    if st.session_state.get("data") is None:
+        return
+    add_key = f"{prefix}_add_select"
+    pick = st.session_state.get(add_key)
+    st.session_state[add_key] = _ADD_PLACEHOLDER
+    if not pick or pick == _ADD_PLACEHOLDER:
+        return
+    current = list(st.session_state.get("selected_neighborhood_ids") or [])
+    # Adding a neighborhood leaves any exclusive base-structure view.
+    current = [c for c in current if c not in _BASE_IDS]
+    if pick in current:
+        return
+    _commit_selection(current + [pick])
+
+
+def _on_nbhd_remove(neigh_id):
+    """Remove a neighborhood tag from the selection (keeping at least one)."""
+    if st.session_state.get("data") is None:
+        return
+    current = list(st.session_state.get("selected_neighborhood_ids") or [])
+    new_ids = [i for i in current if i != neigh_id]
+    if not new_ids:
+        # Preserve the non-empty guarantee the embed relies on.
+        return
+    _commit_selection(new_ids)
 
 
 def _commit_selection(new_ids):
@@ -3788,7 +3912,7 @@ def _render_sidebar_tab_selector(data_loaded):
     col_load, col_explore, col_metrics = st.columns(3)
     with col_load:
         if st.button(
-            "Load graph",
+            "Load",
             key="tab_load_btn",
             type="primary" if active == "Load graph" else "secondary",
             width="stretch",
@@ -3814,16 +3938,13 @@ def _render_sidebar_tab_selector(data_loaded):
             st.session_state["active_sidebar_tab"] = "Metrics"
             st.rerun()
 
-    if not data_loaded:
-        st.caption("Load a graph to enable **Explore** and **Metrics**.")
-
     return active
 
 
 def _render_explore_tab():
     """Post-load controls: neighborhoods (top), 3D view, and graph sample."""
     if st.session_state.get("data") is None:
-        st.info("Load a graph from the **Load graph** tab to explore neighborhoods.")
+        st.info("Load a graph from the **Load** tab to explore neighborhoods.")
         return
 
     _render_neighborhood_picker()
@@ -3844,11 +3965,173 @@ def _render_explore_tab():
     _render_graph_sample_section()
 
 
+def _static_dataframe(rows):
+    """Render a table at full height (no inner scrollbar, never clipped).
+
+    ``st.table`` grows to fit every row, unlike ``st.dataframe`` which caps its
+    height and scrolls. The index is hidden to keep the layout clean.
+    """
+    if not rows:
+        return
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+    try:
+        st.table(df.style.hide(axis="index"))
+    except Exception:
+        st.table(df)
+
+
+def _sparse_to_scipy(sparse_tensor):
+    """Convert a coalesced torch sparse tensor to a scipy COO matrix."""
+    import scipy.sparse as sp
+
+    t = sparse_tensor.coalesce()
+    idx = t.indices().cpu().numpy()
+    vals = t.values().cpu().numpy()
+    shape = tuple(t.shape)
+    return sp.coo_matrix((vals, (idx[0], idx[1])), shape=shape)
+
+
+def _spectral_radius(sparse_tensor):
+    """Largest |eigenvalue| (square) or largest singular value (rectangular).
+
+    For symmetric adjacency matrices these coincide. Small matrices are handled
+    densely; larger ones use sparse iterative solvers with a dense fallback.
+    """
+    if sparse_tensor is None:
+        return None
+    try:
+        import numpy as np
+
+        mat = _sparse_to_scipy(sparse_tensor).asfptype()
+        if min(mat.shape) == 0:
+            return None
+        square = mat.shape[0] == mat.shape[1]
+
+        if min(mat.shape) <= 3:
+            dense = mat.toarray()
+            if square:
+                return float(np.max(np.abs(np.linalg.eigvals(dense))))
+            return float(np.max(np.linalg.svd(dense, compute_uv=False)))
+
+        import scipy.sparse.linalg as sla
+
+        try:
+            if square:
+                ev = sla.eigs(mat, k=1, which="LM", return_eigenvectors=False)
+                return float(np.abs(ev[0]))
+            sv = sla.svds(mat, k=1, return_singular_vectors=False)
+            return float(sv[0])
+        except Exception:
+            dense = mat.toarray()
+            if square:
+                return float(np.max(np.abs(np.linalg.eigvals(dense))))
+            return float(np.max(np.linalg.svd(dense, compute_uv=False)))
+    except Exception:
+        return None
+
+
+def _neighborhood_clustering(sparse_tensor):
+    """Average clustering coefficient for a square (adjacency) neighborhood."""
+    if sparse_tensor is None:
+        return None
+    try:
+        t = sparse_tensor.coalesce()
+        if t.shape[0] != t.shape[1]:
+            return None
+        dim = int(t.shape[0])
+        G, _nd = sparse_to_networkx(t, max_nodes=dim, min_degree=0)
+        if G is None or G.number_of_nodes() == 0:
+            return None
+        UG = G.to_undirected() if G.is_directed() else G
+        return float(nx.average_clustering(UG))
+    except Exception:
+        return None
+
+
+def _compute_selected_structural_metrics():
+    """Spectral radius (all selected) + clustering (adjacency only) per neighborhood.
+
+    Computed on the full neighborhood matrices (not the sampled display) and
+    cached against the current selection / graph index / lifting.
+    """
+    dset0 = st.session_state.get("data")
+    if dset0 is None:
+        return []
+    selected_ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if not selected_ids:
+        return []
+
+    marker = _metrics_marker(selected_ids, expensive=False)
+    cached = st.session_state.get("_struct_metrics")
+    if cached and cached.get("marker") == marker:
+        return cached.get("rows") or []
+
+    rows = []
+    for neigh_id in selected_ids:
+        matrix, _desc, relation_ctx = get_named_visualization_matrix(dset0, neigh_id)
+        if matrix is None:
+            continue
+        radius = _spectral_radius(matrix)
+        is_adjacency = (relation_ctx or {}).get("type") == "adjacency"
+        clustering = _neighborhood_clustering(matrix) if is_adjacency else None
+        rows.append({
+            "Neighborhood": neigh_id,
+            "Spectral radius": gm.fmt_value(radius),
+            "Clustering (adjacency only)": (
+                gm.fmt_value(clustering) if clustering is not None else "—"
+            ),
+        })
+
+    st.session_state["_struct_metrics"] = {"marker": marker, "rows": rows}
+    return rows
+
+
+def _render_dataset_info_section():
+    """Whole-dataset info: YAML metadata + current graph node count + size."""
+    domain = st.session_state.get("cfg_domain")
+    dataset_name = st.session_state.get("dataset_name")
+    meta = extract_dataset_metadata(domain, dataset_name) if domain and dataset_name else {}
+
+    num_nodes = _node_count_from_dataset(st.session_state.get("data"))
+    num_graphs = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+
+    st.subheader("Dataset")
+    if dataset_name:
+        st.caption(f"**{domain}** / **{dataset_name}**")
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.caption(
+            f"**number of nodes:** {num_nodes if num_nodes is not None else 'N/A'}"
+        )
+        st.caption(f"**number of graphs:** {num_graphs}")
+        st.caption(f"**task:** {meta.get('task') or 'N/A'}")
+        st.caption(f"**task_level:** {meta.get('task_level') or 'N/A'}")
+    with col_right:
+        st.caption(
+            f"**num_features:** {_format_num_features(meta.get('num_features'))}"
+        )
+        st.caption(
+            f"**learning_setting:** {meta.get('learning_setting') or 'N/A'}"
+        )
+        st.caption(f"**split_type:** {meta.get('split_type') or 'N/A'}")
+        num_classes = meta.get("num_classes")
+        st.caption(
+            f"**num_classes:** {num_classes if num_classes is not None else 'N/A'}"
+        )
+    if num_nodes is not None and num_graphs > 1:
+        st.caption("Node count is for the currently displayed graph.")
+    st.divider()
+
+
 def _render_metrics_tab():
     """Displayed-graph metrics tab: HUD toggle, whole-graph table, top elements."""
     if st.session_state.get("data") is None:
-        st.info("Load a graph from the **Load graph** tab to see metrics.")
+        st.info("Load a graph from the **Load** tab to see metrics.")
         return
+
+    _render_dataset_info_section()
 
     err = st.session_state.get("_graph_metrics_error")
     if err:
@@ -3886,7 +4169,12 @@ def _render_metrics_tab():
         rows.append({"Metric": label, "Value": gm.fmt_value(graph[key])})
     if rows:
         st.caption("Displayed graph (after sampling)")
-        st.dataframe(rows, hide_index=True, width="stretch")
+        _static_dataframe(rows)
+
+    struct_rows = _compute_selected_structural_metrics()
+    if struct_rows:
+        st.caption("Selected neighborhoods (structural)")
+        _static_dataframe(struct_rows)
 
     _render_metrics_top_elements(metrics)
 
@@ -3941,7 +4229,7 @@ def _render_metrics_top_elements(metrics):
             for nid, val in summary["top_nodes"]
         ]
         if top_rows:
-            st.dataframe(top_rows, hide_index=True, width="stretch")
+            _static_dataframe(top_rows)
 
     edges = metrics.get("edges") or {}
     if edges:
@@ -3949,13 +4237,11 @@ def _render_metrics_top_elements(metrics):
         neg = summary["forman_most_negative"]
         if neg:
             st.caption("Most negative Forman-Ricci edges")
-            st.dataframe(
+            _static_dataframe(
                 [
                     {"Edge": f"{u} — {v}", "Forman": gm.fmt_value(val)}
                     for (u, v), val in neg
-                ],
-                hide_index=True,
-                width="stretch",
+                ]
             )
 
 
@@ -4018,6 +4304,17 @@ def main():
         st.success(flash)
 
     available_datasets = discover_available_datasets()
+
+    # Default selection on first load: domain "graph", dataset "MUTAG".
+    if "cfg_domain" not in st.session_state and "graph" in available_datasets:
+        st.session_state["cfg_domain"] = "graph"
+        if "MUTAG" in available_datasets.get("graph", []):
+            st.session_state["cfg_dataset"] = "MUTAG"
+
+    # "Use lifting" toggle defaults to on for first-time visitors.
+    if "use_lifting" not in st.session_state:
+        st.session_state["use_lifting"] = True
+
     data_loaded = st.session_state.get("data") is not None
 
     sidebar_cfg = None
