@@ -251,14 +251,17 @@ st.markdown(
 )
 
 DEFAULT_RANK_PALETTE = [
-    "#1f77b4",
-    "#ff7f0e",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
-    "#8c564b",
-    "#e377c2",
-    "#7f7f7f",
+    "#1f77b4",  # rank 0 - blue   (Nodes)
+    "#ff7f0e",  # rank 1 - orange (Edges)
+    "#2ca02c",  # rank 2 - green  (Faces)
+    "#d62728",  # rank 3 - red    (Volumes)
+    "#ff2dbf",  # rank 4 - bright magenta (4-cells); was purple #9467bd,
+                # swapped to avoid reading as bluish next to rank-1
+                # orange adjacencies.
+    "#8c564b",  # rank 5 - brown
+    "#9467bd",  # rank 6 - purple (was pink #e377c2; rotated here so rank 4
+                # can take the more eye-catching magenta slot).
+    "#7f7f7f",  # rank 7 - gray
 ]
 
 def _data_keys(data):
