@@ -62,8 +62,30 @@ def build_standalone_d3_html(
         )
 
     use_3d = payload.get("graphType") == "layered3d"
+    # ``3d-force-graph`` is ESM-only as of 1.75+ and requires
+    # ``three >= 0.179``, which itself dropped UMD ``build/three.min.js``
+    # somewhere around r150. Loading them via plain ``<script src>`` tags
+    # therefore no longer works. Instead we use jsdelivr's ``/+esm`` URLs,
+    # which auto-bundle each package as a single ESM module with all
+    # transitive dependencies inlined. We expose both as globals (via a
+    # promise on ``window``) so the rest of our inline non-module script
+    # can pick them up once the modules finish loading.
     force_graph_3d_script = (
-        '  <script src="https://cdn.jsdelivr.net/npm/3d-force-graph"></script>\n'
+        '  <script type="module">\n'
+        '    window.__force3dPromise = (async () => {\n'
+        '      const [fgMod, threeMod] = await Promise.all([\n'
+        '        import("https://cdn.jsdelivr.net/npm/3d-force-graph@1.80.0/+esm"),\n'
+        '        import("https://cdn.jsdelivr.net/npm/three@0.179.1/+esm")\n'
+        '      ]);\n'
+        '      const FG = fgMod.default || fgMod.ForceGraph3D || fgMod;\n'
+        '      window.ForceGraph3D = FG;\n'
+        '      window.THREE = threeMod;\n'
+        '      return { ForceGraph3D: FG, THREE: threeMod };\n'
+        '    })();\n'
+        '    window.__force3dPromise.catch(function(err) {\n'
+        '      window.__force3dError = (err && err.message) ? err.message : String(err);\n'
+        '    });\n'
+        '  </script>\n'
         if use_3d
         else ""
     )
@@ -96,16 +118,23 @@ def build_standalone_d3_html(
       background: rgba(255, 255, 255, 0.92); border: 1px solid #d0d0d0;
       border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.35;
       box-shadow: 0 1px 4px rgba(0,0,0,0.08); pointer-events: none;
-      max-width: min(220px, 60%);
+      max-width: min(280px, 65%);
     }}
     #legend .legend-title {{ display: block; font-weight: 600; font-size: 11px;
       color: #555; letter-spacing: 0.02em; text-transform: uppercase;
       margin-bottom: 6px; }}
+    #legend .legend-section + .legend-section {{
+      margin-top: 8px; padding-top: 8px;
+      border-top: 1px dashed rgba(0,0,0,0.12);
+    }}
     #legend .legend-row {{ display: flex; align-items: center; gap: 8px;
       margin: 3px 0; }}
     #legend .legend-dot {{ display: inline-block; width: 12px; height: 12px;
       border-radius: 50%; border: 1px solid rgba(0,0,0,0.18); flex-shrink: 0; }}
     #legend .legend-label {{ color: #222; }}
+    #legend .legend-glyph {{ flex-shrink: 0; display: inline-block;
+      line-height: 0; }}
+    #legend .legend-glyph svg {{ display: block; }}
     #metrics-hud {{
       display: none; position: absolute; top: 10px; left: 10px; z-index: 5;
       background: rgba(255, 255, 255, 0.92); border: 1px solid #d0d0d0;
@@ -166,20 +195,105 @@ def build_standalone_d3_html(
       (function renderLegend() {
         var box = document.getElementById("legend");
         if (!box) return;
-        var entries = (payload.legend || []).filter(function(e) { return e && e.color; });
-        if (entries.length === 0) {
+        var rankEntries = (payload.legend || []).filter(function(e) { return e && e.color; });
+        var relEntries = (payload.relationsLegend || []).filter(function(e) { return !!e; });
+        if (rankEntries.length === 0 && relEntries.length === 0) {
           box.innerHTML = "";
           box.style.display = "none";
           return;
         }
-        var html = '<span class="legend-title">Legend</span>';
-        entries.forEach(function(e) {
-          var label = e.label || ("Rank " + e.rank);
-          html += '<div class="legend-row">'
-            + '<span class="legend-dot" style="background:' + e.color + '"></span>'
-            + '<span class="legend-label">' + label + '</span>'
-            + '</div>';
-        });
+
+        function escAttr(s) {
+          return String(s == null ? "" : s).replace(/"/g, "&quot;");
+        }
+        function escText(s) {
+          return String(s == null ? "" : s)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+
+        // Build a compact two-node + edge glyph that mirrors the actual
+        // plot: gradient + directional arrow for incidence relations,
+        // solid colour line for adjacency relations. The source endpoint
+        // always sits on the left and the target on the right, so the
+        // arrow naturally points right -- "up" incidences run lower ->
+        // higher rank, "down" incidences run higher -> lower.
+        function relationGlyphHtml(rel, idx) {
+          var W = 110, H = 18, R = 5, padX = 6;
+          var x1 = padX + R;
+          var x2 = W - padX - R;
+          var midY = H / 2;
+          var defsParts = [];
+          var lineExtra = '';
+          var lineX2 = x2;
+          if (rel.kind === "incidence") {
+            var gradId = "lglegrad-" + idx;
+            var arrowId = "lglegarrow-" + idx;
+            defsParts.push(
+              '<linearGradient id="' + gradId + '"'
+              + ' x1="' + x1 + '" y1="' + midY
+              + '" x2="' + x2 + '" y2="' + midY
+              + '" gradientUnits="userSpaceOnUse">'
+              + '<stop offset="0%" stop-color="' + escAttr(rel.colorStart) + '"/>'
+              + '<stop offset="100%" stop-color="' + escAttr(rel.colorEnd) + '"/>'
+              + '</linearGradient>'
+            );
+            defsParts.push(
+              '<marker id="' + arrowId + '" viewBox="0 -5 10 10" refX="9"'
+              + ' refY="0" markerWidth="7" markerHeight="7" orient="auto">'
+              + '<path d="M0,-4L8,0L0,4Z" fill="' + escAttr(rel.colorEnd)
+              + '" opacity="0.92"/></marker>'
+            );
+            lineExtra = ' stroke="url(#' + gradId + ')"'
+              + ' marker-end="url(#' + arrowId + ')"';
+            // Pull the line back slightly so the arrow tip lands just at
+            // the target circle border, not buried inside it.
+            lineX2 = x2 - 1;
+          } else {
+            lineExtra = ' stroke="' + escAttr(rel.color || "#888") + '"';
+          }
+          return '<svg width="' + W + '" height="' + H
+            + '" viewBox="0 0 ' + W + ' ' + H + '">'
+            + (defsParts.length ? '<defs>' + defsParts.join('') + '</defs>' : '')
+            + '<line x1="' + x1 + '" y1="' + midY
+            + '" x2="' + lineX2 + '" y2="' + midY
+            + '" stroke-width="1.6"' + lineExtra + '/>'
+            + '<circle cx="' + x1 + '" cy="' + midY + '" r="' + (R - 0.5)
+            + '" fill="' + escAttr(rel.srcColor) + '" stroke="#fff"'
+            + ' stroke-width="1"/>'
+            + '<circle cx="' + x2 + '" cy="' + midY + '" r="' + (R - 0.5)
+            + '" fill="' + escAttr(rel.tgtColor) + '" stroke="#fff"'
+            + ' stroke-width="1"/>'
+            + '</svg>';
+        }
+
+        var html = '';
+        if (rankEntries.length) {
+          html += '<div class="legend-section">'
+            + '<span class="legend-title">Ranks</span>';
+          rankEntries.forEach(function(e) {
+            var label = e.label || ("Rank " + e.rank);
+            html += '<div class="legend-row">'
+              + '<span class="legend-dot" style="background:'
+              + escAttr(e.color) + '"></span>'
+              + '<span class="legend-label">' + escText(label) + '</span>'
+              + '</div>';
+          });
+          html += '</div>';
+        }
+        if (relEntries.length) {
+          html += '<div class="legend-section">'
+            + '<span class="legend-title">Neighborhoods</span>';
+          relEntries.forEach(function(rel, i) {
+            html += '<div class="legend-row">'
+              + '<span class="legend-glyph">'
+              + relationGlyphHtml(rel, i)
+              + '</span>'
+              + '<span class="legend-label">' + escText(rel.label || "")
+              + '</span>'
+              + '</div>';
+          });
+          html += '</div>';
+        }
         box.innerHTML = html;
         box.style.display = "block";
       })();
@@ -214,11 +328,92 @@ def build_standalone_d3_html(
         return;
       }
 
+      // Multiple adjacencies between the same node pair (e.g.
+      // ``1-up_adjacency-0`` and ``2-up_adjacency-0`` both connecting
+      // the same two nodes) used to be merged into a single edge with
+      // a blended colour. Python now emits one payload link per
+      // via-rank; here we tag duplicate-endpoint links with a
+      // symmetric "slot" so both 2D and 3D pipelines can offset them
+      // perpendicular to the line and render them as visible
+      // parallel edges. Done once on ``payload.links`` so both the
+      // 2D and 3D map() copies below pick up the same slot values.
+      (function assignParallelSlots() {
+        const groups = new Map();
+        (payload.links || []).forEach(function(l) {
+          const a = String(l.source);
+          const b = String(l.target);
+          const key = (a < b) ? (a + "\u0001" + b) : (b + "\u0001" + a);
+          let arr = groups.get(key);
+          if (!arr) { arr = []; groups.set(key, arr); }
+          arr.push(l);
+        });
+        groups.forEach(function(arr) {
+          const n = arr.length;
+          arr.forEach(function(l, i) {
+            l._parallelCount = n;
+            l._parallelSlot = (n > 1) ? (i - (n - 1) / 2) : 0;
+          });
+        });
+      })();
+      // Per-slot perpendicular gap, sized so parallel edges sit flush
+      // against each other (reading like one "double-thick" multicoloured
+      // stroke) rather than as visually separated rails. The gap equals
+      // the on-screen stroke width: 1.8 px in 2D (matches the ``<line>``
+      // stroke-width) and ``2 * LINK_RADIUS`` = 1.0 world unit in 3D
+      // (matches the cylinder diameter).
+      const PARALLEL_GAP_2D = 1.8;
+      const PARALLEL_GAP_3D = 1.0;
+
       if (payload.graphType === "layered3d") {
-        if (typeof ForceGraph3D === "undefined") {
-          showError("3d-force-graph failed to load from CDN. Connect to the internet or use a recent browser.");
-          return;
+        // ``3d-force-graph`` is now ESM-only, so it's loaded async via an
+        // import() in a separate module script that resolves
+        // ``window.__force3dPromise`` to ``{ ForceGraph3D, THREE }``. We
+        // defer 3D scene construction until that promise resolves.
+        function build3DScene() {
+          if (typeof ForceGraph3D === "undefined") {
+            showError("3d-force-graph failed to load from CDN. Connect to the internet or use a recent browser.");
+            return;
+          }
+          _build3D();
         }
+        if (window.__force3dPromise) {
+          window.__force3dPromise.then(build3DScene).catch(function(err) {
+            showError(
+              "3D libraries failed to load from CDN: "
+              + (err && err.message ? err.message : String(err))
+              + ". Connect to the internet or open this file in a recent browser."
+            );
+          });
+        } else if (window.__force3dError) {
+          showError(
+            "3D libraries failed to load from CDN: "
+            + window.__force3dError
+            + ". Connect to the internet or open this file in a recent browser."
+          );
+        } else {
+          // Fallback: the module loader hasn't installed the promise yet.
+          // Poll briefly, then surface the global if it appeared, or report.
+          var attempts = 0;
+          var poll = setInterval(function() {
+            attempts += 1;
+            if (window.__force3dPromise) {
+              clearInterval(poll);
+              window.__force3dPromise.then(build3DScene).catch(function(err) {
+                showError(
+                  "3D libraries failed to load from CDN: "
+                  + (err && err.message ? err.message : String(err))
+                );
+              });
+            } else if (attempts > 200) {  // ~10s
+              clearInterval(poll);
+              showError("3d-force-graph failed to load from CDN. Connect to the internet or open this file in a recent browser.");
+            }
+          }, 50);
+        }
+        return;
+      }
+
+      function _build3D() {
         const chart = document.getElementById("chart");
         const width = Math.max(420, chart.clientWidth || window.innerWidth || 800);
         const height = Math.max(420, chart.clientHeight || (window.innerHeight - 100) || 600);
@@ -241,9 +436,21 @@ def build_standalone_d3_html(
             source: String(l.source),
             target: String(l.target),
             color: l.color,
-            metrics: l.metrics
+            colorStart: l.colorStart,
+            colorEnd: l.colorEnd,
+            kind: l.kind,
+            metrics: l.metrics,
+            _parallelSlot: l._parallelSlot || 0,
+            _parallelCount: l._parallelCount || 1
           };
         });
+
+        // ``THREE`` is loaded from CDN ahead of ``3d-force-graph``. When
+        // available we render each link as a custom ``THREE.Line`` with a
+        // two-stop vertex-color gradient (start at source, end at target),
+        // mirroring the 2D SVG ``<linearGradient>`` look. Otherwise we fall
+        // back to a flat per-link color so the view still renders.
+        const hasTHREE = (typeof THREE !== "undefined");
         const graph3d = ForceGraph3D()(chart)
           .width(width)
           .height(height)
@@ -252,11 +459,125 @@ def build_standalone_d3_html(
           .nodeColor(function(n) { return n.color || "#666"; })
           .nodeLabel(function(n) { return nodeTooltip(n); })
           .nodeVal(function(n) { return 1 + Math.log1p(n.degree || 1); })
-          .linkColor(function(l) { return l.color || "#888"; })
           .linkLabel(function(l) { return edgeTooltip(l); })
-          .linkOpacity(0.6)
-          .linkWidth(0.6)
-          .graphData({ nodes: nodes3d, links: links3d });
+          // Directional arrows on incidence (cross-rank) links only.
+          // Adjacency edges live within a single rank and remain undirected.
+          // ``3d-force-graph`` builds these as ``THREE.Mesh`` cones whose
+          // *base* width scales with ``linkDirectionalArrowLength``, so a
+          // larger length produces a chunkier head as well as a longer one.
+          // ``linkDirectionalArrowRelPos`` is the parametric position along
+          // the segment (0 = at source, 1 = at target); ``0.97`` puts the
+          // cone tip just shy of the destination node surface.
+          .linkDirectionalArrowLength(function(l) {
+            return l.kind === "incidence" ? 6.0 : 0;
+          })
+          .linkDirectionalArrowRelPos(0.99)
+          .linkDirectionalArrowColor(function(l) {
+            return l.colorEnd || l.color || "#888888";
+          });
+
+        if (hasTHREE) {
+          // ``THREE.Line`` / ``LineBasicMaterial`` is hard-capped to a 1-pixel
+          // stroke on virtually every WebGL platform, so it can never match
+          // the 2D SVG line thickness. Instead we represent each link as a
+          // thin cylinder ``THREE.Mesh`` with vertex-coloured gradients along
+          // its length, then orient and stretch it from source to target
+          // every frame. Cylinder mesh is built as a unit-length tube along
+          // local +Y; the base sits at the origin and the cap at (0, 1, 0).
+          const LINK_RADIUS = 0.5;       // tube radius (similar to 2D ~1.2 px stroke)
+          const RADIAL_SEGMENTS = 8;     // smooth enough at typical view scales
+          graph3d
+            .linkThreeObject(function(l) {
+              var startStr = l.colorStart || l.color || "#888888";
+              var endStr = l.colorEnd || l.color || startStr;
+              var cStart = new THREE.Color(startStr);
+              var cEnd = new THREE.Color(endStr);
+              // Open-ended cylinder of unit height along +Y, then translate
+              // upward by 0.5 so its base sits at (0, 0, 0).
+              var geom = new THREE.CylinderGeometry(
+                LINK_RADIUS, LINK_RADIUS, 1, RADIAL_SEGMENTS, 1, true
+              );
+              geom.translate(0, 0.5, 0);
+              var pos = geom.attributes.position;
+              var colors = new Float32Array(pos.count * 3);
+              var tmp = new THREE.Color();
+              for (var i = 0; i < pos.count; i++) {
+                // y in [0, 1] post-translate; lerp from start colour at
+                // the base to end colour at the cap.
+                var t = Math.min(1, Math.max(0, pos.getY(i)));
+                tmp.copy(cStart).lerp(cEnd, t);
+                colors[i * 3 + 0] = tmp.r;
+                colors[i * 3 + 1] = tmp.g;
+                colors[i * 3 + 2] = tmp.b;
+              }
+              geom.setAttribute(
+                "color",
+                new THREE.BufferAttribute(colors, 3)
+              );
+              var mat = new THREE.MeshBasicMaterial({
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.85
+              });
+              var mesh = new THREE.Mesh(geom, mat);
+              // Defensive: skip the default ``Object3D`` raycasting (not
+              // needed and would otherwise consume tooltip events).
+              mesh.raycast = function() {};
+              // Stash the parallel-slot info on the mesh itself so the
+              // per-frame ``linkPositionUpdate`` can apply the
+              // perpendicular offset without depending on the 3rd
+              // argument signature of every 3d-force-graph build.
+              mesh.userData._parallelSlot = (l && l._parallelSlot) || 0;
+              mesh.userData._parallelCount = (l && l._parallelCount) || 1;
+              return mesh;
+            })
+            .linkPositionUpdate(function(mesh, posObj, link) {
+              if (!mesh) return false;
+              var sx = posObj.start.x, sy = posObj.start.y, sz = posObj.start.z;
+              var ex = posObj.end.x,   ey = posObj.end.y,   ez = posObj.end.z;
+              var dx = ex - sx, dy = ey - sy, dz = ez - sz;
+              var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+              // Apply the same perpendicular-slot offset as 2D so that
+              // duplicate-endpoint links (parallel adjacencies) render as
+              // visibly separate cylinders instead of overlapping cores.
+              var slot = (mesh.userData && mesh.userData._parallelSlot) || 0;
+              if (slot === 0 && link && link._parallelSlot) {
+                slot = link._parallelSlot;
+              }
+              var ox = 0, oy = 0, oz = 0;
+              if (slot !== 0 && len > 1e-6) {
+                // Build a unit vector perpendicular to the edge. Cross with
+                // world-up first; if the edge is nearly vertical, fall back
+                // to world-right so the basis is always well-defined.
+                var dir = new THREE.Vector3(dx / len, dy / len, dz / len);
+                var up = new THREE.Vector3(0, 1, 0);
+                if (Math.abs(dir.dot(up)) > 0.95) {
+                  up = new THREE.Vector3(1, 0, 0);
+                }
+                var perp = new THREE.Vector3().crossVectors(dir, up).normalize();
+                var off = slot * PARALLEL_GAP_3D;
+                ox = perp.x * off; oy = perp.y * off; oz = perp.z * off;
+              }
+              mesh.position.set(sx + ox, sy + oy, sz + oz);
+              // Stretch along local +Y to match the actual edge length.
+              mesh.scale.set(1, Math.max(len, 1e-6), 1);
+              if (len > 1e-6) {
+                var yAxis = new THREE.Vector3(0, 1, 0);
+                var dir2 = new THREE.Vector3(dx / len, dy / len, dz / len);
+                mesh.quaternion.setFromUnitVectors(yAxis, dir2);
+              }
+              // Returning ``true`` tells 3d-force-graph that we've handled
+              // the per-frame position update for this link.
+              return true;
+            });
+        } else {
+          graph3d
+            .linkColor(function(l) { return l.color || "#888888"; })
+            .linkOpacity(0.85)
+            .linkWidth(1.4);
+        }
+
+        graph3d.graphData({ nodes: nodes3d, links: links3d });
         var chargeForce = graph3d.d3Force("charge");
         if (chargeForce) chargeForce.strength(-40);
         var linkForce = graph3d.d3Force("link");
@@ -289,10 +610,25 @@ def build_standalone_d3_html(
           color: l.color,
           colorStart: l.colorStart,
           colorEnd: l.colorEnd,
+          kind: l.kind,
           metrics: l.metrics,
+          _parallelSlot: l._parallelSlot || 0,
+          _parallelCount: l._parallelCount || 1,
           _gradId: (l.colorStart && l.colorEnd) ? ("grad-link-" + idx) : null
         };
       }).filter(function(l) { return l.source && l.target; });
+
+      // Arrowheads for incidence (cross-rank) links only. Adjacency edges
+      // live within a single rank and stay undirected. Each unique
+      // end-color gets its own ``<marker>`` so the arrow tip naturally
+      // matches whatever the link's ``colorEnd`` is, even when the line
+      // itself is drawn with a gradient stroke.
+      function arrowColorIdSuffix(c) {
+        return String(c).replace(/[^a-zA-Z0-9]/g, "");
+      }
+      function linkArrowColor(l) {
+        return l.colorEnd || l.color || "#444";
+      }
 
       const chart = document.getElementById("chart");
       const width = Math.max(420, chart.clientWidth || window.innerWidth || 800);
@@ -315,6 +651,28 @@ def build_standalone_d3_html(
       gradients.append("stop")
         .attr("offset", "100%")
         .attr("stop-color", function(d) { return d.colorEnd || d.color || "#888"; });
+
+      const arrowColorSet = new Set();
+      links.forEach(function(l) {
+        if (l.kind === "incidence") arrowColorSet.add(linkArrowColor(l));
+      });
+      const arrowColors = Array.from(arrowColorSet);
+      defs.selectAll("marker.arrow")
+        .data(arrowColors)
+        .join("marker")
+        .attr("class", "arrow")
+        .attr("id", function(c) { return "arrow-" + arrowColorIdSuffix(c); })
+        .attr("viewBox", "0 -5 10 10")
+        .attr("refX", 9)
+        .attr("refY", 0)
+        .attr("markerUnits", "userSpaceOnUse")
+        .attr("markerWidth", 8)
+        .attr("markerHeight", 8)
+        .attr("orient", "auto")
+        .append("path")
+          .attr("d", "M0,-4L8,0L0,4Z")
+          .attr("fill", function(c) { return c; })
+          .attr("opacity", 0.92);
 
       const g = svg.append("g");
       const zoom = d3.zoom()
@@ -371,7 +729,7 @@ def build_standalone_d3_html(
             .attr("y1", y).attr("y2", y)
             .attr("stroke", "#ccc")
             .attr("stroke-dasharray", "4 6")
-            .attr("stroke-width", 1);
+            .attr("stroke-width", 1.8);
           bandG.append("text")
             .attr("x", width - 8).attr("y", y - 6)
             .attr("text-anchor", "end")
@@ -390,9 +748,47 @@ def build_standalone_d3_html(
         .attr("stroke", function(d) {
           return d._gradId ? ("url(#" + d._gradId + ")") : (d.color || "#888");
         })
-        .attr("stroke-width", 1.2);
+        .attr("stroke-width", 1.8)
+        .attr("marker-end", function(d) {
+          if (d.kind !== "incidence") return null;
+          return "url(#arrow-" + arrowColorIdSuffix(linkArrowColor(d)) + ")";
+        });
 
       link.append("title").text(function(d) { return edgeTooltip(d); });
+
+      function nodeRadius(d) {
+        return 5 + Math.min(16, Math.log1p((d && d.degree) || 1) * 3.2);
+      }
+      function updateLinkGeometry(d) {
+        var sx = d.source.x, sy = d.source.y;
+        var tx = d.target.x, ty = d.target.y;
+        var dx = tx - sx, dy = ty - sy;
+        var len = Math.sqrt(dx * dx + dy * dy);
+        // Perpendicular offset so duplicate-endpoint links (mostly
+        // adjacencies sharing a node pair across different via-ranks)
+        // render as parallel lines instead of pixel-perfect overlaps.
+        var ox = 0, oy = 0;
+        var slot = d._parallelSlot || 0;
+        if (slot !== 0 && isFinite(len) && len > 1e-3) {
+          var nx = -dy / len, ny = dx / len;
+          var off = slot * PARALLEL_GAP_2D;
+          ox = nx * off;
+          oy = ny * off;
+        }
+        d._x1 = sx + ox;
+        d._y1 = sy + oy;
+        if (d.kind === "incidence" && isFinite(len) && len > 1e-3) {
+          // Pull the visible endpoint back to the node border plus a small
+          // clearance so the marker tip is fully visible outside the circle.
+          var r = nodeRadius(d.target) + 3.5;
+          var k = Math.max(0, (len - r) / len);
+          d._x2 = sx + dx * k + ox;
+          d._y2 = sy + dy * k + oy;
+        } else {
+          d._x2 = tx + ox;
+          d._y2 = ty + oy;
+        }
+      }
 
       const node = g.append("g").selectAll("g")
         .data(nodes)
@@ -428,15 +824,16 @@ def build_standalone_d3_html(
 
       simulation.on("tick", function() {
         link
-          .attr("x1", function(d) { return d.source.x; })
-          .attr("y1", function(d) { return d.source.y; })
-          .attr("x2", function(d) { return d.target.x; })
-          .attr("y2", function(d) { return d.target.y; });
+          .each(updateLinkGeometry)
+          .attr("x1", function(d) { return d._x1; })
+          .attr("y1", function(d) { return d._y1; })
+          .attr("x2", function(d) { return d._x2; })
+          .attr("y2", function(d) { return d._y2; });
         gradients
-          .attr("x1", function(d) { return d.source.x; })
-          .attr("y1", function(d) { return d.source.y; })
-          .attr("x2", function(d) { return d.target.x; })
-          .attr("y2", function(d) { return d.target.y; });
+          .attr("x1", function(d) { return d._x1; })
+          .attr("y1", function(d) { return d._y1; })
+          .attr("x2", function(d) { return d._x2; })
+          .attr("y2", function(d) { return d._y2; });
         node.attr("transform", function(d) {
           return "translate(" + d.x + "," + d.y + ")";
         });

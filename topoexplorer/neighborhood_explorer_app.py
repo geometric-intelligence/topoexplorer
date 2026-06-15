@@ -58,6 +58,17 @@ def _setup_root_with_fallback(search_from, indicator=".project-root", **kwargs):
 
 rootutils.setup_root = _setup_root_with_fallback
 
+
+# Domains whose datasets already carry higher-order connectivity (incidence,
+# adjacency, Laplacian matrices, etc.) baked in by their loader (e.g. the
+# MANTRA simplicial loader runs ``get_complex_connectivity`` during build).
+# For these domains the "Use lifting" toggle defaults to off, because applying
+# a transform would discard or rebuild the structure that's already there.
+_NATIVE_HIGHER_ORDER_DOMAINS = frozenset(
+    {"simplicial", "hypergraph", "cell", "combinatorial"}
+)
+
+
 # ============================================================================
 # Dataset Discovery Functions
 # ============================================================================
@@ -366,6 +377,171 @@ def friendly_rank_label(rank, rank_labels=None) -> str:
     return f"{rk}-cells"
 
 
+_CELLS_TERM_BY_RANK = {0: "Nodes", 1: "Edges", 2: "Faces", 3: "Volumes"}
+
+
+def _cells_term(rank, *, target_kind=None):
+    """Return the universal cell-dimension label for a rank.
+
+    Uses the simplicial/cell-complex terminology requested in the legend:
+    ``0`` → ``Nodes``, ``1`` → ``Edges``, ``2`` → ``Faces``, ``3`` →
+    ``Volumes``, and ``k`` → ``"<k>-cells"`` for ``k ≥ 4``. The
+    ``target_kind="hyperedge"`` override is used for the special
+    ``incidence_hyperedges`` view.
+    """
+    if target_kind == "hyperedge":
+        return "Hyperedges"
+    if rank is None:
+        return "Cells"
+    try:
+        r = int(rank)
+    except Exception:
+        return str(rank)
+    if r in _CELLS_TERM_BY_RANK:
+        return _CELLS_TERM_BY_RANK[r]
+    return f"{r}-cells"
+
+
+def _neighborhood_id_for_incidence(src_rank, tgt_rank, direction):
+    """Reconstruct the canonical ``r-direction_incidence-s`` id.
+
+    Returns ``None`` if the inputs don't form a valid neighborhood spec.
+    """
+    if src_rank is None or tgt_rank is None or direction not in ("up", "down"):
+        return None
+    s = int(src_rank)
+    t = int(tgt_rank)
+    if direction == "up":
+        r = t - s
+        return f"{r}-up_incidence-{s}" if r > 0 else None
+    r = s - t
+    return f"{r}-down_incidence-{s}" if r > 0 else None
+
+
+def _neighborhood_id_for_adjacency(src_rank, via_rank):
+    """Reconstruct the canonical ``r-direction_adjacency-s`` id."""
+    if src_rank is None or via_rank is None:
+        return None
+    s = int(src_rank)
+    v = int(via_rank)
+    if v > s:
+        return f"{v - s}-up_adjacency-{s}"
+    if v < s:
+        return f"{s - v}-down_adjacency-{s}"
+    return f"adjacency-{s}"
+
+
+def _build_relations_legend(links_out, rank_labels=None):
+    """Aggregate per-link metadata in ``links_out`` into legend rows.
+
+    Returns one entry per unique relation rendered, with enough data for
+    the JS renderer to draw a small two-node + edge glyph that mirrors
+    the actual plot (gradient + directional arrow for incidences, solid
+    colour for adjacencies). Each row's label combines the canonical
+    neighborhood id with cell-dimension terminology, e.g.
+    ``"2-down_incidence-2: Faces → Nodes"`` or
+    ``"1-up_adjacency-0: Nodes ↔ Nodes via Edges"``.
+    """
+    # ``rank_labels`` is accepted for API parity with the rank legend but
+    # the relations legend deliberately uses the universal cell-dimension
+    # terminology requested by the user, so the parameter is unused here.
+    del rank_labels
+
+    seen = set()
+    out = []
+
+    def _emit_incidence(src_rank, tgt_rank, direction, *,
+                        color, color_start, color_end, target_kind):
+        key = ("incidence", src_rank, tgt_rank, direction, target_kind)
+        if key in seen:
+            return
+        seen.add(key)
+        nb_id = _neighborhood_id_for_incidence(src_rank, tgt_rank, direction)
+        src_term = _cells_term(src_rank)
+        tgt_term = _cells_term(tgt_rank, target_kind=target_kind)
+        body = f"{src_term} → {tgt_term}"
+        label = f"{nb_id}: {body}" if nb_id else body
+        out.append({
+            "kind": "incidence",
+            "srcRank": src_rank,
+            "tgtRank": tgt_rank,
+            "srcColor": rank_color(src_rank) if src_rank is not None else "#888888",
+            "tgtColor": rank_color(tgt_rank) if tgt_rank is not None else "#888888",
+            "colorStart": color_start,
+            "colorEnd": color_end,
+            "color": color,
+            "direction": direction,
+            "neighborhoodId": nb_id,
+            "label": label,
+        })
+
+    for link in links_out or []:
+        kind = link.get("kind") or "incidence"
+        if kind == "adjacency":
+            via_ranks = link.get("viaRanks") or []
+            via = int(via_ranks[0]) if via_ranks else None
+            # The visual src/tgt rank of an adjacency edge is the same -
+            # both endpoints live at the same rank. Try to recover it
+            # from ``srcRank``/``tgtRank`` first, then fall back to the
+            # via-rank as a defensive default.
+            src_rank = link.get("srcRank")
+            if src_rank is None:
+                src_rank = via
+            key = ("adjacency", int(src_rank) if src_rank is not None else None, via)
+            if key in seen:
+                continue
+            seen.add(key)
+            color = link.get("color") or (rank_color(via) if via is not None else "#888888")
+            src_color = rank_color(src_rank) if src_rank is not None else "#888888"
+            nb_id = _neighborhood_id_for_adjacency(src_rank, via)
+            term = _cells_term(src_rank)
+            via_term = _cells_term(via)
+            body = f"{term} ↔ {term} via {via_term}"
+            label = f"{nb_id}: {body}" if nb_id else body
+            out.append({
+                "kind": "adjacency",
+                "srcRank": src_rank,
+                "tgtRank": src_rank,
+                "srcColor": src_color,
+                "tgtColor": src_color,
+                "color": color,
+                "viaRank": via,
+                "neighborhoodId": nb_id,
+                "label": label,
+            })
+        else:
+            src_rank = link.get("srcRank")
+            tgt_rank = link.get("tgtRank")
+            direction = link.get("direction") or "up"
+            target_kind = link.get("targetKind")
+            color = link.get("color")
+            color_start = link.get("colorStart")
+            color_end = link.get("colorEnd")
+            if direction == "both" and src_rank is not None and tgt_rank is not None:
+                # Both an up- and a down-incidence spec contributed to
+                # this edge. Show the user each direction separately so
+                # the canonical ids still match what they selected.
+                lo = min(int(src_rank), int(tgt_rank))
+                hi = max(int(src_rank), int(tgt_rank))
+                _emit_incidence(
+                    lo, hi, "up",
+                    color=color, color_start=color_start,
+                    color_end=color_end, target_kind=target_kind,
+                )
+                _emit_incidence(
+                    hi, lo, "down",
+                    color=color, color_start=color_end,
+                    color_end=color_start, target_kind=target_kind,
+                )
+            else:
+                _emit_incidence(
+                    src_rank, tgt_rank, direction,
+                    color=color, color_start=color_start,
+                    color_end=color_end, target_kind=target_kind,
+                )
+    return out
+
+
 def _build_legend(ranks, rank_labels=None):
     """Legend entries: list of ``{rank, color, label}`` for the given ranks."""
     out = []
@@ -410,7 +586,16 @@ def load_dataset(domain, dataset_name):
             'data_dir': str(project_root / 'datasets'),
             'log_dir': str(project_root / 'logs'),
         },
-        'model': {'model_name': '', 'backbone': {'neighborhoods': None}},
+        # Minimal stand-ins for keys that dataset configs sometimes interpolate
+        # from the model side of a full training config (e.g. MANTRA simplicial
+        # configs use ``model_domain: ${model.model_domain}``). We default
+        # ``model_domain`` to the dataset's own domain so the loader treats the
+        # data as native (no implicit lifting).
+        'model': {
+            'model_name': '',
+            'model_domain': domain,
+            'backbone': {'neighborhoods': None},
+        },
     }
 
     cfg = OmegaConf.create(base_config)
@@ -420,11 +605,24 @@ def load_dataset(domain, dataset_name):
     try:
         cfg_resolved = OmegaConf.to_container(cfg, resolve=True)
     except Exception:
+        # Some configs reference keys we don't model here (e.g. split_params
+        # referencing ``${dataset.loader.parameters.data_name}`` is fine, but
+        # arbitrary ``${something.else}`` won't resolve). Resolve the loader
+        # (which is what we actually need) on its own, with the same base
+        # ``paths``/``model`` available, and fill the rest with best-effort
+        # unresolved values so the descriptive UI still has something to show.
         loader_cfg = OmegaConf.create({
             'paths': base_config['paths'],
+            'model': base_config['model'],
             'dataset': {'loader': dataset_yaml.get('loader', {})},
         })
-        loader_resolved = OmegaConf.to_container(loader_cfg, resolve=True)
+        try:
+            loader_resolved = OmegaConf.to_container(loader_cfg, resolve=True)
+        except Exception:
+            # As a last resort, drop the still-unresolvable interpolations.
+            loader_only_unresolved = OmegaConf.to_container(loader_cfg, resolve=False)
+            loader_only_unresolved = _strip_unresolvable_interpolations(loader_only_unresolved)
+            loader_resolved = loader_only_unresolved
         full_unresolved = OmegaConf.to_container(cfg, resolve=False)
         full_unresolved = _strip_unresolvable_interpolations(full_unresolved)
         cfg_resolved = full_unresolved
@@ -848,7 +1046,12 @@ def get_named_visualization_matrix(data, neigh_id):
         return (
             inc,
             "incidence_hyperedges (Rank 0 → hyperedges)",
-            {"type": "bipartite", "source_rank": 0, "target_kind": "hyperedge"},
+            {
+                "type": "bipartite",
+                "source_rank": 0,
+                "target_kind": "hyperedge",
+                "incidence_direction": "up",
+            },
         )
 
     m = re.match(r"^incidence_(\d+)$", neigh_id)
@@ -863,7 +1066,12 @@ def get_named_visualization_matrix(data, neigh_id):
         return (
             sp,
             f"incidence_{k} (Rank {src_rank} → Rank {k})",
-            {"type": "bipartite", "source_rank": src_rank, "target_rank": k},
+            {
+                "type": "bipartite",
+                "source_rank": src_rank,
+                "target_rank": k,
+                "incidence_direction": "up",
+            },
         )
 
     m = re.match(r"^adjacency_(\d+)$", neigh_id)
@@ -892,14 +1100,52 @@ def get_named_visualization_matrix(data, neigh_id):
             }
         else:
             tgt_rank = _neighborhood_target_rank(neigh_id)
+            # TopoBench's ``select_neighborhoods_of_interest`` always stores
+            # incidence matrices in ``(N_target, N_source)`` shape -- both for
+            # ``up`` and ``down`` neighborhoods. For the bipartite renderer
+            # to label/colour each side correctly *and* draw the arrow in the
+            # correct direction (up -> arrow toward highest rank, down ->
+            # arrow toward lowest rank), we canonicalise to
+            # ``(N_source_rank, N_target_rank)`` so that ``idx[0]`` maps to
+            # the operator's source side and ``idx[1]`` to its target side.
+            try:
+                sp = sp.coalesce().transpose(0, 1).coalesce()
+            except Exception:
+                pass
             relation_ctx = {
                 "type": "bipartite",
                 "source_rank": src_rank,
                 "target_rank": tgt_rank,
+                "incidence_direction": direction,
             }
         return sp, f"{neigh_id} ({desc})", relation_ctx
 
     return None, None, None
+
+
+def _incidence_direction_for_id(nid: str) -> str:
+    """Return ``'up'`` or ``'down'`` for an incidence neighborhood id.
+
+    Canonical ``incidence_k`` and ``incidence_hyperedges`` matrices are stored
+    in ``(N_lower, N_higher)`` orientation, i.e. an *up* incidence. The
+    TopoBench-style ``r-direction_incidence-s`` ids encode their direction
+    explicitly. Unknown ids fall back to ``"up"`` (the convention used
+    throughout the visualiser).
+    """
+    if not nid:
+        return "up"
+    if nid in ("hyperedges", "incidence_hyperedges"):
+        return "up"
+    if nid.startswith("incidence_"):
+        return "up"
+    if "-" in nid:
+        try:
+            _r, direction, ntype, _src = parse_neighborhood(nid)
+            if ntype == "incidence":
+                return direction
+        except Exception:
+            pass
+    return "up"
 
 
 def pick_default_neighborhood_id(available):
@@ -1193,8 +1439,8 @@ def sparse_to_networkx(
     if is_adjacency and target_allowed is None:
         target_allowed = source_allowed
 
-    node_degrees = {}
     if is_adjacency:
+        node_degrees = {}
         seen_pairs = set()
         kept_pairs = []
         for i in range(n_edges):
@@ -1214,63 +1460,111 @@ def sparse_to_networkx(
             u, v = pair
             node_degrees[u] = node_degrees.get(u, 0) + 1
             node_degrees[v] = node_degrees.get(v, 0) + 1
-    else:
-        kept_pairs = []
-        for i in range(n_edges):
-            src = int(indices[0, i])
-            tgt = int(indices[1, i])
-            if source_allowed is not None and src not in source_allowed:
-                continue
-            if target_allowed is not None and tgt not in target_allowed:
-                continue
-            kept_pairs.append((src, tgt))
-            node_degrees[src] = node_degrees.get(src, 0) + 1
-            node_degrees[tgt] = node_degrees.get(tgt, 0) + 1
 
-    if min_degree > 0:
-        node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
-    if not node_degrees:
-        return None, {}
+        if min_degree > 0:
+            node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
+        if not node_degrees:
+            return None, {}
 
-    # Legacy fallback for callers not using canonical masks.
-    if source_allowed is None and target_allowed is None and len(node_degrees) > max_nodes:
-        top_nodes = sorted(
-            node_degrees.keys(),
-            key=lambda node_id: (-node_degrees[node_id], int(node_id)),
-        )[:max_nodes]
-        node_degrees = {k: node_degrees[k] for k in top_nodes}
+        # Legacy fallback for callers not using canonical masks.
+        if source_allowed is None and target_allowed is None and len(node_degrees) > max_nodes:
+            top_nodes = sorted(
+                node_degrees.keys(),
+                key=lambda node_id: (-node_degrees[node_id], int(node_id)),
+            )[:max_nodes]
+            node_degrees = {k: node_degrees[k] for k in top_nodes}
 
-    valid_nodes = set(node_degrees.keys())
-    if is_adjacency:
+        valid_nodes = set(node_degrees.keys())
         G = nx.Graph()
         for node in valid_nodes:
             G.add_node(node, degree=node_degrees[node])
         for src, tgt in kept_pairs:
             if src in valid_nodes and tgt in valid_nodes:
                 G.add_edge(src, tgt)
-    else:
-        G = nx.DiGraph()
-        src_present = set()
-        tgt_present = set()
-        for src, tgt in kept_pairs:
-            if src in valid_nodes:
-                src_present.add(src)
-            if tgt in valid_nodes:
-                tgt_present.add(tgt)
 
-        for node in src_present:
-            G.add_node(f"src_{node}", bipartite=0, original_id=node)
-        for node in tgt_present:
-            G.add_node(f"tgt_{node}", bipartite=1, original_id=node)
+        if len(G.nodes()) == 0:
+            return None, {}
+        return G, node_degrees
 
-        for src, tgt in kept_pairs:
-            src_key = f"src_{src}"
-            tgt_key = f"tgt_{tgt}"
-            if src_key in G and tgt_key in G:
-                G.add_edge(src_key, tgt_key)
+    # Bipartite (incidence) path: source and target ids live in disjoint id
+    # spaces (e.g. rank-0 cells vs rank-1 cells) and can numerically collide.
+    # Track degrees in two separate dicts so they don't get conflated, and
+    # always feed back a single combined ``node_degrees`` mapping keyed by the
+    # raw original id of each side -- callers tag each node with its layer
+    # (``src_*``/``tgt_*``) when looking up the degree.
+    src_degrees: dict = {}
+    tgt_degrees: dict = {}
+    kept_pairs = []
+    for i in range(n_edges):
+        src = int(indices[0, i])
+        tgt = int(indices[1, i])
+        if source_allowed is not None and src not in source_allowed:
+            continue
+        if target_allowed is not None and tgt not in target_allowed:
+            continue
+        kept_pairs.append((src, tgt))
+        src_degrees[src] = src_degrees.get(src, 0) + 1
+        tgt_degrees[tgt] = tgt_degrees.get(tgt, 0) + 1
+
+    if min_degree > 0:
+        src_degrees = {k: v for k, v in src_degrees.items() if v >= min_degree}
+        tgt_degrees = {k: v for k, v in tgt_degrees.items() if v >= min_degree}
+    if not src_degrees and not tgt_degrees:
+        return None, {}
+
+    # Legacy fallback for callers not using canonical masks. Cap each side
+    # separately so we don't accidentally drop all of one side.
+    if source_allowed is None and target_allowed is None:
+        if len(src_degrees) > max_nodes:
+            top_src = sorted(
+                src_degrees.keys(),
+                key=lambda nid: (-src_degrees[nid], int(nid)),
+            )[:max_nodes]
+            src_degrees = {k: src_degrees[k] for k in top_src}
+        if len(tgt_degrees) > max_nodes:
+            top_tgt = sorted(
+                tgt_degrees.keys(),
+                key=lambda nid: (-tgt_degrees[nid], int(nid)),
+            )[:max_nodes]
+            tgt_degrees = {k: tgt_degrees[k] for k in top_tgt}
+
+    valid_src = set(src_degrees.keys())
+    valid_tgt = set(tgt_degrees.keys())
+
+    G = nx.DiGraph()
+    src_present = set()
+    tgt_present = set()
+    for src, tgt in kept_pairs:
+        if src not in valid_src or tgt not in valid_tgt:
+            continue
+        src_present.add(src)
+        tgt_present.add(tgt)
+
+    for node in src_present:
+        G.add_node(
+            f"src_{node}", bipartite=0, original_id=node,
+            degree=src_degrees.get(node, 0),
+        )
+    for node in tgt_present:
+        G.add_node(
+            f"tgt_{node}", bipartite=1, original_id=node,
+            degree=tgt_degrees.get(node, 0),
+        )
+
+    for src, tgt in kept_pairs:
+        src_key = f"src_{src}"
+        tgt_key = f"tgt_{tgt}"
+        if src_key in G and tgt_key in G:
+            G.add_edge(src_key, tgt_key)
 
     if len(G.nodes()) == 0:
         return None, {}
+
+    # Combined degree map: caller looks up by ``(bipartite_side, original_id)``
+    # via the per-node ``degree`` attribute; we also return a flat dict keyed
+    # by string node id for ``networkx_to_d3_payload`` compatibility (it falls
+    # back to the per-node attribute when the raw id isn't found).
+    node_degrees = {n: G.nodes[n]["degree"] for n in G.nodes()}
     return G, node_degrees
 
 
@@ -1358,7 +1652,13 @@ def networkx_to_d3_payload(
                     label = f"rank_{target_rank}_id={deg_key}"
                 layer = 1
 
-        degree = _json_safe_float(node_degrees.get(deg_key, 1))
+        # Prefer the per-node ``degree`` attribute set by the builder (always
+        # disambiguated by side for bipartite graphs); fall back to the legacy
+        # raw-id lookup or the live graph degree.
+        raw_deg = G.nodes[node].get("degree")
+        if raw_deg is None:
+            raw_deg = node_degrees.get(node, node_degrees.get(deg_key, G.degree(node)))
+        degree = _json_safe_float(raw_deg)
         stroke = "#fff"
         color_use = color
         if selected_node is not None:
@@ -1389,6 +1689,7 @@ def networkx_to_d3_payload(
                 "target": str(v),
                 "color": adj_c,
                 "kind": "adjacency",
+                "srcRank": int(src_rank) if src_rank is not None else None,
                 "viaRanks": [int(via_rank)],
             }
             for u, v in G.edges()
@@ -1399,6 +1700,10 @@ def networkx_to_d3_payload(
         color_at_src = rank_color(target_rank)
         color_at_tgt = rank_color(src_rank)
         midpoint = blend_hex(color_at_src, color_at_tgt)
+        incidence_direction = (relation_context or {}).get(
+            "incidence_direction", "up"
+        )
+        incidence_target_kind = (relation_context or {}).get("target_kind")
         links_out = [
             {
                 "source": str(u),
@@ -1409,6 +1714,8 @@ def networkx_to_d3_payload(
                 "kind": "incidence",
                 "srcRank": src_rank,
                 "tgtRank": target_rank,
+                "direction": incidence_direction,
+                "targetKind": incidence_target_kind,
             }
             for u, v in G.edges()
         ]
@@ -1425,6 +1732,7 @@ def networkx_to_d3_payload(
         "nodes": nodes_out,
         "links": links_out,
         "legend": _build_legend(legend_ranks, rank_labels),
+        "relationsLegend": _build_relations_legend(links_out, rank_labels),
     }
 
 
@@ -1470,24 +1778,33 @@ def build_layered_networkx(
     if not incidence_specs:
         return None, {}, []
 
-    specs = sorted(
-        [(sp.coalesce() if sp is not None else None, int(sr), int(tr))
-         for sp, sr, tr in incidence_specs if sp is not None],
-        key=lambda t: t[1],
-    )
+    specs = []
+    for spec in incidence_specs:
+        if spec is None or spec[0] is None:
+            continue
+        sp = spec[0].coalesce()
+        sr = int(spec[1])
+        tr = int(spec[2])
+        direction = str(spec[3]) if len(spec) >= 4 else "up"
+        specs.append((sp, sr, tr, direction))
+    specs.sort(key=lambda t: t[1])
     if not specs:
         return None, {}, []
 
+    # ``raw_edges`` carries the per-occurrence direction so we can later
+    # mark each unique edge with the direction(s) of the incidence
+    # operator(s) that produced it. ``layer_nodes`` is purely the (rank,
+    # node-id) catalogue.
     raw_edges = []
     layer_nodes = {}
-    for sp, sr, tr in specs:
+    for sp, sr, tr, direction in specs:
         idx = sp.indices().numpy()
         for i in range(idx.shape[1]):
             src_orig = int(idx[0, i])
             tgt_orig = int(idx[1, i])
             u = _layered_node_id(sr, src_orig)
             v = _layered_node_id(tr, tgt_orig)
-            raw_edges.append((u, v))
+            raw_edges.append((u, v, direction))
             layer_nodes.setdefault(sr, {})[u] = src_orig
             layer_nodes.setdefault(tr, {})[v] = tgt_orig
 
@@ -1495,7 +1812,7 @@ def build_layered_networkx(
         return None, {}, []
 
     degree = {}
-    for u, v in raw_edges:
+    for u, v, _d in raw_edges:
         degree[u] = degree.get(u, 0) + 1
         degree[v] = degree.get(v, 0) + 1
 
@@ -1534,15 +1851,22 @@ def build_layered_networkx(
                 break
         G.add_node(n, layer=int(rank), original_id=int(orig))
 
-    seen_pairs = set()
-    for u, v in raw_edges:
+    # First-pass: collapse per-occurrence directions into a per-edge set so
+    # that an edge contributed to by both an up- and a down-incidence ends
+    # up tagged ``"both"`` (we then default to "up" when drawing arrows).
+    pair_dirs = {}
+    for u, v, direction in raw_edges:
         if u not in selected or v not in selected:
             continue
         pair = (u, v) if u < v else (v, u)
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-        G.add_edge(u, v, kind="incidence")
+        pair_dirs.setdefault(pair, set()).add(direction)
+
+    for (u, v), dirs in pair_dirs.items():
+        if len(dirs) == 1:
+            edge_direction = next(iter(dirs))
+        else:
+            edge_direction = "both"
+        G.add_edge(u, v, kind="incidence", direction=edge_direction)
 
     isolated = [n for n in G.nodes() if G.degree(n) == 0]
     G.remove_nodes_from(isolated)
@@ -1675,14 +1999,16 @@ def build_combined_layered_networkx(
     Adjacency specs are 3-tuples ``(sparse, src_rank, via_rank)``; edges
     accumulate the set of via-ranks observed across all selected adjacencies.
     """
-    specs_inc = sorted(
-        [
-            (sp.coalesce() if sp is not None else None, int(sr), int(tr))
-            for sp, sr, tr in incidence_specs
-            if sp is not None
-        ],
-        key=lambda t: t[1],
-    )
+    specs_inc = []
+    for spec in incidence_specs:
+        if spec is None or spec[0] is None:
+            continue
+        sp = spec[0].coalesce()
+        sr = int(spec[1])
+        tr = int(spec[2])
+        direction = str(spec[3]) if len(spec) >= 4 else "up"
+        specs_inc.append((sp, sr, tr, direction))
+    specs_inc.sort(key=lambda t: t[1])
 
     normalized_adj = []
     for spec in adjacency_specs:
@@ -1697,18 +2023,18 @@ def build_combined_layered_networkx(
     if not specs_inc and not specs_adj:
         return None, {}, []
 
-    raw_inc_edges = []  # list of (u, v)
+    raw_inc_edges = []  # list of (u, v, direction)
     adj_pair_via = {}  # (u, v) -> set[int]  with u<v lexicographically
     layer_nodes = {}
 
-    for sp, sr, tr in specs_inc:
+    for sp, sr, tr, direction in specs_inc:
         idx = sp.indices().numpy()
         for i in range(idx.shape[1]):
             src_orig = int(idx[0, i])
             tgt_orig = int(idx[1, i])
             u = _layered_node_id(sr, src_orig)
             v = _layered_node_id(tr, tgt_orig)
-            raw_inc_edges.append((u, v))
+            raw_inc_edges.append((u, v, direction))
             layer_nodes.setdefault(sr, {})[u] = src_orig
             layer_nodes.setdefault(tr, {})[v] = tgt_orig
 
@@ -1730,7 +2056,7 @@ def build_combined_layered_networkx(
         return None, {}, []
 
     degree = {}
-    for u, v in raw_inc_edges:
+    for u, v, _d in raw_inc_edges:
         degree[u] = degree.get(u, 0) + 1
         degree[v] = degree.get(v, 0) + 1
     for (u, v) in adj_pair_via:
@@ -1771,15 +2097,21 @@ def build_combined_layered_networkx(
                 break
         G.add_node(n, layer=int(rank), original_id=int(orig))
 
-    seen_inc = set()
-    for u, v in raw_inc_edges:
+    # Collect every direction that contributed to each unique incidence
+    # pair so we can render the arrow in the correct direction later.
+    inc_pair_dirs = {}
+    for u, v, direction in raw_inc_edges:
         if u not in selected or v not in selected:
             continue
         pair = (u, v) if u < v else (v, u)
-        if pair in seen_inc:
-            continue
-        seen_inc.add(pair)
-        G.add_edge(u, v, kind="incidence")
+        inc_pair_dirs.setdefault(pair, set()).add(direction)
+
+    for (u, v), dirs in inc_pair_dirs.items():
+        if len(dirs) == 1:
+            edge_direction = next(iter(dirs))
+        else:
+            edge_direction = "both"
+        G.add_edge(u, v, kind="incidence", direction=edge_direction)
 
     for (u, v), via_set in adj_pair_via.items():
         if u not in selected or v not in selected:
@@ -1837,34 +2169,64 @@ def networkx_to_layered_d3_payload(
         u_layer = int(G.nodes[u].get("layer", 0))
         v_layer = int(G.nodes[v].get("layer", 0))
         if kind == "adjacency":
-            via_ranks = data.get("via_ranks")
-            if via_ranks:
-                colors = [rank_color(int(r)) for r in via_ranks]
-                lc = colors[0] if len(colors) == 1 else blend_hex(*colors)
-            else:
-                lc = rank_color(u_layer)
-            links_out.append({
-                "source": str(u),
-                "target": str(v),
-                "color": lc,
-                "kind": "adjacency",
-                "viaRanks": [int(r) for r in (via_ranks or [u_layer])],
-            })
+            # If the same node-pair adjacency arises from multiple via-ranks
+            # (e.g. selected ``1-up_adjacency-0`` *and* ``2-up_adjacency-0``)
+            # we no longer blend their colours into one; instead we emit
+            # one link per via-rank, each keeping its own rank colour. The
+            # JS renderer offsets duplicate-endpoint links perpendicular
+            # to the line direction so they draw as visible parallel edges
+            # rather than overlapping.
+            via_ranks = data.get("via_ranks") or [u_layer]
+            for via in via_ranks:
+                v_int = int(via)
+                links_out.append({
+                    "source": str(u),
+                    "target": str(v),
+                    "color": rank_color(v_int),
+                    "kind": "adjacency",
+                    "srcRank": int(u_layer),
+                    "viaRanks": [v_int],
+                })
         else:
+            # Orient the link so the arrow tip points the way the user
+            # expects: up-incidences flow lower -> higher rank (arrow toward
+            # highest rank), down-incidences flow higher -> lower (arrow
+            # toward lowest rank). When an edge was contributed to by both
+            # up and down specs we default to "up". For edges that don't
+            # carry a direction tag (legacy builders) we also default to
+            # "up", which matches the canonical ``incidence_k`` orientation.
+            direction = data.get("direction", "up")
+            if u_layer == v_layer:
+                src_node, tgt_node = u, v
+                src_layer, tgt_layer = u_layer, v_layer
+            else:
+                if u_layer < v_layer:
+                    lower_node, lower_layer = u, u_layer
+                    higher_node, higher_layer = v, v_layer
+                else:
+                    lower_node, lower_layer = v, v_layer
+                    higher_node, higher_layer = u, u_layer
+                if direction == "down":
+                    src_node, src_layer = higher_node, higher_layer
+                    tgt_node, tgt_layer = lower_node, lower_layer
+                else:
+                    src_node, src_layer = lower_node, lower_layer
+                    tgt_node, tgt_layer = higher_node, higher_layer
             # Reversed gradient: near each endpoint we paint with the *other*
             # endpoint's rank color (per user spec).
-            color_at_u = rank_color(v_layer)
-            color_at_v = rank_color(u_layer)
-            midpoint = blend_hex(color_at_u, color_at_v)
+            color_at_src = rank_color(tgt_layer)
+            color_at_tgt = rank_color(src_layer)
+            midpoint = blend_hex(color_at_src, color_at_tgt)
             links_out.append({
-                "source": str(u),
-                "target": str(v),
+                "source": str(src_node),
+                "target": str(tgt_node),
                 "color": midpoint,
-                "colorStart": color_at_u,
-                "colorEnd": color_at_v,
+                "colorStart": color_at_src,
+                "colorEnd": color_at_tgt,
                 "kind": kind or "incidence",
-                "srcRank": u_layer,
-                "tgtRank": v_layer,
+                "srcRank": src_layer,
+                "tgtRank": tgt_layer,
+                "direction": direction,
             })
 
     return {
@@ -1878,6 +2240,7 @@ def networkx_to_layered_d3_payload(
             str(r): rank_labels.get(r, f"Rank {r}") for r in layers_sorted
         },
         "legend": _build_legend(layers_sorted, rank_labels),
+        "relationsLegend": _build_relations_legend(links_out, rank_labels),
     }
 
 
@@ -2409,10 +2772,22 @@ def _render_left_config(available_datasets):
             st.session_state["_last_dataset_key"] = dataset_key
             if "main_graph_index_input" in st.session_state:
                 del st.session_state["main_graph_index_input"]
+            # When switching to a dataset whose domain has native higher-order
+            # connectivity (e.g. MANTRA simplicial complexes already come with
+            # full incidence/adjacency/laplacian matrices), default the
+            # "Use lifting" toggle to off — applying a transform would only
+            # discard or overwrite that structure. Users can still opt in.
+            if selected_domain in _NATIVE_HIGHER_ORDER_DOMAINS:
+                st.session_state["use_lifting"] = False
+            else:
+                st.session_state["use_lifting"] = True
 
+    # ``value=`` is intentionally omitted: ``st.session_state["use_lifting"]``
+    # is seeded in ``main()`` before this widget renders, and Streamlit warns
+    # if a keyed widget receives both a default ``value`` and a pre-existing
+    # session-state value.
     use_lifting = st.toggle(
         "Use lifting",
-        value=st.session_state.get("use_lifting", False),
         key="use_lifting",
     )
 
@@ -2980,7 +3355,9 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                incidence_specs.append((sp, src, tgt))
+                incidence_specs.append(
+                    (sp, src, tgt, _incidence_direction_for_id(nid))
+                )
 
             adjacency_specs = []
             for nid in adjacency_ids:
@@ -2999,8 +3376,8 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 return False
 
             ranks_chosen = sorted(
-                {sr for _, sr, _ in incidence_specs}
-                | {tr for _, _, tr in incidence_specs}
+                {spec[1] for spec in incidence_specs}
+                | {spec[2] for spec in incidence_specs}
                 | {rank for _, rank, _ in adjacency_specs}
             )
             G_load, nd_load, layers = build_combined_layered_networkx(
@@ -3055,14 +3432,14 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
                 if sp is None:
                     st.error(f"Neighborhood '{nid}' is not available.")
                     return False
-                specs.append((sp, src, tgt))
+                specs.append((sp, src, tgt, _incidence_direction_for_id(nid)))
 
             if not specs:
                 st.error("No valid incidence neighborhoods selected for layered rendering.")
                 return False
 
-            ranks_chosen = sorted({sr for _, sr, _ in specs}
-                                  | {tr for _, _, tr in specs})
+            ranks_chosen = sorted({sr for _, sr, _, _ in specs}
+                                  | {tr for _, _, tr, _ in specs})
             expected = list(range(min(ranks_chosen), max(ranks_chosen) + 1))
             if ranks_chosen != expected:
                 missing = sorted(set(expected) - set(ranks_chosen))
@@ -3338,6 +3715,15 @@ def _finalize_loaded_sample(dset0, cfg, loaded_domain, dataset_name,
     if hyperedge_cap is not None and num_hyperedges is not None:
         hyperedge_cap = max(0, min(int(hyperedge_cap), int(num_hyperedges)))
 
+    # Remember the per-rank populations of *this* sample so that a later
+    # sample switch can tell whether each carried-over cap was at the
+    # previous sample's maximum (and therefore should be refreshed to the
+    # new sample's maximum) or was explicitly clamped below by the user.
+    st.session_state["_loaded_rank_pops"] = {int(r): int(p) for r, p in rank_pops.items()}
+    st.session_state["_loaded_hyperedge_pop"] = (
+        int(num_hyperedges) if num_hyperedges is not None else None
+    )
+
     min_degree = int(cfg.get("min_degree", 0))
     if sync_widgets:
         for rank, cap in caps_by_rank.items():
@@ -3423,9 +3809,35 @@ def _reload_graph_at_index(graph_index):
         current_data[0] if hasattr(current_data, "__getitem__") else current_data
     )
 
+    # Build the carry-over caps for the new sample. A cap stored against
+    # the *previous* sample is carried over only if the user had clamped
+    # it strictly below that sample's full population. Caps that were at
+    # the previous sample's max are dropped so the new sample's auto-
+    # default (= its own full population, up to DEFAULT_LARGE_CAP) takes
+    # effect -- this is what fixes the "MANTRA samples all look the same"
+    # issue where sample 0's small population would otherwise pin every
+    # subsequent sample to the same tiny cap.
+    prev_pops = st.session_state.get("_loaded_rank_pops") or {}
+    loaded_caps = st.session_state.get("_loaded_rank_caps") or {}
+    carry_caps = {}
+    for rank, cap in loaded_caps.items():
+        prev_pop = prev_pops.get(int(rank))
+        if prev_pop is None:
+            carry_caps[int(rank)] = int(cap)
+        elif int(cap) < int(prev_pop):
+            carry_caps[int(rank)] = int(cap)
+        # else: was at max on previous sample, drop so finalize re-derives
+
+    prev_hyper_pop = st.session_state.get("_loaded_hyperedge_pop")
+    loaded_hyper = st.session_state.get("_loaded_hyperedge_cap")
+    carry_hyper = None
+    if loaded_hyper is not None:
+        if prev_hyper_pop is None or int(loaded_hyper) < int(prev_hyper_pop):
+            carry_hyper = int(loaded_hyper)
+
     finalize_cfg = {
-        "caps_by_rank": st.session_state.get("_loaded_rank_caps") or {},
-        "hyperedge_cap": st.session_state.get("_loaded_hyperedge_cap"),
+        "caps_by_rank": carry_caps,
+        "hyperedge_cap": carry_hyper,
         "max_nodes": st.session_state.get("_loaded_max_nodes", DEFAULT_LARGE_CAP),
         "min_degree": st.session_state.get("_loaded_min_degree", 0),
     }
@@ -3520,11 +3932,13 @@ def _render_rank_cap_sliders(rank_populations, hyperedge_population):
             all_cap_default = int(
                 st.session_state.get("ui_set_all_rank_caps", DEFAULT_LARGE_CAP)
             )
+            st.session_state["ui_set_all_rank_caps"] = max(
+                0, min(all_cap_default, int(max_rank_pop))
+            )
             all_cap = st.number_input(
                 "Set all ranks to",
                 min_value=0,
                 max_value=int(max_rank_pop),
-                value=max(0, min(all_cap_default, int(max_rank_pop))),
                 step=1,
                 key="ui_set_all_rank_caps",
             )
@@ -3554,11 +3968,11 @@ def _render_rank_cap_sliders(rank_populations, hyperedge_population):
         key = f"ui_rank_cap_{rank}"
         default_cap = _default_cap_for_population(pop_int)
         value_cap = int(st.session_state.get(key, default_cap))
+        st.session_state[key] = max(0, min(value_cap, pop_int))
         ui_rank_caps[int(rank)] = st.slider(
             f"{label_prefix} cap",
             min_value=0,
             max_value=pop_int,
-            value=max(0, min(value_cap, pop_int)),
             key=key,
             on_change=_on_sampling_control_change,
         )
@@ -3573,11 +3987,13 @@ def _render_rank_cap_sliders(rank_populations, hyperedge_population):
             hyper_value = int(
                 st.session_state.get("ui_hyperedge_cap", hyper_default)
             )
+            st.session_state["ui_hyperedge_cap"] = max(
+                0, min(hyper_value, hyper_pop_int)
+            )
             ui_hyperedge_cap = st.slider(
                 "Hyperedge cap",
                 min_value=0,
                 max_value=hyper_pop_int,
-                value=max(0, min(hyper_value, hyper_pop_int)),
                 key="ui_hyperedge_cap",
                 on_change=_on_sampling_control_change,
             )
@@ -3598,11 +4014,11 @@ def _render_inline_rank_cap(rank_populations, hyperedge_population):
         key = f"ui_rank_cap_{rank}"
         default_cap = _default_cap_for_population(pop_int)
         value_cap = int(st.session_state.get(key, default_cap))
+        st.session_state[key] = max(0, min(value_cap, pop_int))
         ui_rank_caps[int(rank)] = st.slider(
             f"{label_prefix} cap",
             min_value=0,
             max_value=pop_int,
-            value=max(0, min(value_cap, pop_int)),
             key=key,
             on_change=_on_sampling_control_change,
         )
@@ -3615,11 +4031,13 @@ def _render_inline_rank_cap(rank_populations, hyperedge_population):
             hyper_value = int(
                 st.session_state.get("ui_hyperedge_cap", hyper_default)
             )
+            st.session_state["ui_hyperedge_cap"] = max(
+                0, min(hyper_value, hyper_pop_int)
+            )
             ui_hyperedge_cap = st.slider(
                 "Hyperedge cap",
                 min_value=0,
                 max_value=hyper_pop_int,
-                value=max(0, min(hyper_value, hyper_pop_int)),
                 key="ui_hyperedge_cap",
                 on_change=_on_sampling_control_change,
             )
@@ -3720,7 +4138,10 @@ def _on_sampling_control_change():
         snap["max_nodes"] = cfg.get("max_nodes", DEFAULT_LARGE_CAP)
         snap["min_degree"] = cfg.get("min_degree", 0)
         st.session_state["_load_cfg_snapshot"] = snap
-        st.rerun()
+        # No explicit ``st.rerun()``: this runs as a widget ``on_change``
+        # callback and Streamlit reruns the script automatically after the
+        # callback returns. Calling ``st.rerun()`` here would emit
+        # "Calling st.rerun() within a callback is a no-op."
 
 
 def _on_main_graph_index_change():
@@ -3751,7 +4172,8 @@ def _on_main_graph_index_change():
     if _reload_graph_at_index(idx):
         st.session_state["main_graph_index_input"] = str(idx)
         st.session_state.pop("_graph_index_error", None)
-        st.rerun()
+        # No explicit ``st.rerun()``: this runs as a widget ``on_change``
+        # callback and Streamlit reruns the script automatically afterwards.
 
 
 def _render_graph_index_input(active, error=None):
@@ -3808,11 +4230,14 @@ def _render_graph_sample_section():
     else:
         st.caption("Single graph (transductive dataset)")
 
+    # ``value=`` omitted on purpose: ``_persist_widget_state`` re-seeds the
+    # session-state entry on every run, so passing ``value=`` would trigger
+    # Streamlit's "default value but also set via Session State" warning.
+    st.session_state.setdefault("ui_min_degree", 0)
     st.slider(
         "Minimum degree",
         min_value=0,
         max_value=20,
-        value=int(st.session_state.get("ui_min_degree", 0)),
         key="ui_min_degree",
         help="Drop nodes below this degree after rank caps are applied.",
         on_change=_on_sampling_control_change,
@@ -4144,9 +4569,9 @@ def _render_metrics_tab():
         st.caption("Metrics will appear once a graph is displayed.")
         return
 
+    st.session_state.setdefault("show_metrics_hud", True)
     st.toggle(
         "Show metrics overlay",
-        value=bool(st.session_state.get("show_metrics_hud", True)),
         key="show_metrics_hud",
         help="Compact whole-graph metrics in the top-left of the graph canvas.",
         on_change=_on_metrics_option_change,
@@ -4179,9 +4604,9 @@ def _render_metrics_tab():
     _render_metrics_top_elements(metrics)
 
     with st.expander("Advanced metrics"):
+        st.session_state.setdefault("metrics_expensive", False)
         st.checkbox(
             "Compute advanced metrics (betweenness, closeness, eccentricity, …)",
-            value=bool(st.session_state.get("metrics_expensive", False)),
             key="metrics_expensive",
             help=(
                 "Heavier centralities. May be slow or approximated on large "
