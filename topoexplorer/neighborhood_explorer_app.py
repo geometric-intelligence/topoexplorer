@@ -1,9 +1,10 @@
 """
 Interactive Hypergraph Neighborhood Explorer
 
-Graph views open in the default browser as a standalone D3 page.
+Graph views are rendered inline as embedded D3 components, with an optional
+download button that exports the same view as a standalone HTML file.
 
-Run with: streamlit run analysis/neighborhood_explorer_app.py
+Run with: streamlit run topoexplorer/neighborhood_explorer_app.py
 """
 
 import sys
@@ -12,12 +13,7 @@ import copy
 import json
 import re
 import math
-import platform
-import shutil
-import subprocess
-import tempfile
 import uuid
-import webbrowser
 from pathlib import Path
 import yaml
 
@@ -2339,53 +2335,6 @@ def networkx_to_layered_d3_payload(
         "legend": _build_legend(layers_sorted, rank_labels),
         "relationsLegend": _build_relations_legend(links_out, rank_labels),
     }
-
-
-def launch_html_in_browser(path: Path) -> bool:
-    """
-    Open a local HTML file in a real browser.
-
-    Prefer the OS default browser first (so it matches the user's current choice),
-    then fall back to common browser executables on Windows.
-    """
-    path = path.resolve()
-    try:
-        if webbrowser.open(path.as_uri()):
-            return True
-    except Exception:
-        pass
-
-    if platform.system() == "Windows":
-        candidates = [
-            shutil.which("chrome"),
-            os.environ.get("PROGRAMFILES", "")
-            + r"\Google\Chrome\Application\chrome.exe",
-            os.environ.get("PROGRAMFILES(X86)", "")
-            + r"\Google\Chrome\Application\chrome.exe",
-            shutil.which("msedge"),
-            os.environ.get("PROGRAMFILES(X86)", "")
-            + r"\Microsoft\Edge\Application\msedge.exe",
-            os.environ.get("PROGRAMFILES", "") + r"\Microsoft\Edge\Application\msedge.exe",
-            shutil.which("firefox"),
-            os.environ.get("PROGRAMFILES", "") + r"\Mozilla Firefox\firefox.exe",
-        ]
-        for exe in candidates:
-            if not exe:
-                continue
-            exe_path = Path(exe)
-            if not exe_path.exists():
-                continue
-            try:
-                subprocess.Popen([str(exe_path), str(path)], close_fds=True)
-                return True
-            except Exception:
-                continue
-        try:
-            os.startfile(str(path))  # noqa: S606
-            return True
-        except Exception:
-            pass
-    return False
 
 
 # ============================================================================
