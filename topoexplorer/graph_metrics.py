@@ -271,7 +271,6 @@ GRAPH_METRIC_LABELS = [
     ("avg_clustering", "Avg clustering"),
     ("transitivity", "Transitivity"),
     ("diameter", "Diameter"),
-    ("radius", "Radius"),
     ("assortativity", "Degree assortativity"),
 ]
 

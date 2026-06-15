@@ -1,9 +1,10 @@
 """
 Interactive Hypergraph Neighborhood Explorer
 
-Graph views open in the default browser as a standalone D3 page.
+Graph views are rendered inline as embedded D3 components, with an optional
+download button that exports the same view as a standalone HTML file.
 
-Run with: streamlit run analysis/neighborhood_explorer_app.py
+Run with: streamlit run topoexplorer/neighborhood_explorer_app.py
 """
 
 import sys
@@ -12,12 +13,7 @@ import copy
 import json
 import re
 import math
-import platform
-import shutil
-import subprocess
-import tempfile
 import uuid
-import webbrowser
 from pathlib import Path
 import yaml
 
@@ -251,14 +247,17 @@ st.markdown(
 )
 
 DEFAULT_RANK_PALETTE = [
-    "#1f77b4",
-    "#ff7f0e",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
-    "#8c564b",
-    "#e377c2",
-    "#7f7f7f",
+    "#1f77b4",  # rank 0 - blue   (Nodes)
+    "#ff7f0e",  # rank 1 - orange (Edges)
+    "#2ca02c",  # rank 2 - green  (Faces)
+    "#d62728",  # rank 3 - red    (Volumes)
+    "#ff2dbf",  # rank 4 - bright magenta (4-cells); was purple #9467bd,
+                # swapped to avoid reading as bluish next to rank-1
+                # orange adjacencies.
+    "#8c564b",  # rank 5 - brown
+    "#9467bd",  # rank 6 - purple (was pink #e377c2; rotated here so rank 4
+                # can take the more eye-catching magenta slot).
+    "#7f7f7f",  # rank 7 - gray
 ]
 
 def _data_keys(data):
@@ -733,21 +732,39 @@ def _build_relations_legend(
             src_rank = link.get("srcRank")
             if src_rank is None:
                 src_rank = via
-            key = ("adjacency", int(src_rank) if src_rank is not None else None, via)
+            # Pseudo-neighborhoods (e.g. ``"graph"`` for the pairwise
+            # edge_index backbone) carry an explicit legend label and
+            # disable the technical neighborhood-id prefix so the entry
+            # reads as e.g. ``"Graph backbone"`` instead of the
+            # awkward ``"0-up_adjacency-0: Nodes ↔ Nodes via Nodes"``.
+            override_label = link.get("legendLabel")
+            suppress_nb_id = bool(link.get("suppressNeighborhoodId"))
+            key = (
+                "adjacency",
+                int(src_rank) if src_rank is not None else None,
+                via,
+                override_label or "",
+            )
             if key in seen:
                 continue
             seen.add(key)
-            nb_id = link.get("neighborhoodId") or _neighborhood_id_for_adjacency(src_rank, via)
+            if suppress_nb_id:
+                nb_id = None
+            else:
+                nb_id = link.get("neighborhoodId") or _neighborhood_id_for_adjacency(src_rank, via)
             if solid:
                 color = _solid_for_nb(nb_id, link.get("color") or "#888888")
                 src_color = _LEGEND_NEUTRAL
             else:
                 color = link.get("color") or (rank_color(via) if via is not None else "#888888")
                 src_color = rank_color(src_rank) if src_rank is not None else "#888888"
-            term = _cells_term(src_rank)
-            via_term = _cells_term(via)
-            body = f"{term} ↔ {term} via {via_term}"
-            label = f"{nb_id}: {body}" if nb_id else body
+            if override_label:
+                label = override_label
+            else:
+                term = _cells_term(src_rank)
+                via_term = _cells_term(via)
+                body = f"{term} ↔ {term} via {via_term}"
+                label = f"{nb_id}: {body}" if nb_id else body
             out.append({
                 "kind": "adjacency",
                 "srcRank": src_rank,
@@ -792,9 +809,25 @@ def _build_relations_legend(
     return out
 
 def _build_legend(ranks, rank_labels=None):
-    """Legend entries: list of ``{rank, color, label}`` for the given ranks."""
+    """Legend entries: list of ``{rank, color, label}`` for the given ranks.
+
+    When ``rank_labels`` describes more ranks than ``ranks`` does (e.g. the
+    dataset has cells up to faces but the current view only contains
+    rank-0 nodes), we *always* include every known rank in the legend.
+    Adjacency edges colour themselves by their mediating via-rank, so the
+    user can encounter rank colours that don't correspond to any node
+    layer currently on screen; showing all dataset ranks keeps those
+    colour-to-rank associations visible.
+    """
+    rank_set = {int(x) for x in ranks}
+    if rank_labels:
+        for r in rank_labels.keys():
+            try:
+                rank_set.add(int(r))
+            except (TypeError, ValueError):
+                continue
     out = []
-    for r in sorted({int(x) for x in ranks}):
+    for r in sorted(rank_set):
         out.append({
             "rank": r,
             "color": rank_color(r),
@@ -1282,10 +1315,21 @@ def get_named_visualization_matrix(data, neigh_id):
         adj = edge_index_to_sparse_adj(data)
         if adj is None:
             return None, None, None
+        # ``"graph"`` is a pseudo-neighborhood (the raw pairwise edge_index)
+        # rather than a topobench operator. The default adjacency legend
+        # template ("0-up_adjacency-0: Nodes ↔ Nodes via Nodes") reads
+        # oddly here because there's no real mediating rank, so we pin
+        # a custom label and signal that no canonical id should be
+        # displayed for the entry.
         return (
             adj,
             "Graph (adjacency from edge_index)",
-            {"type": "adjacency", "source_rank": 0},
+            {
+                "type": "adjacency",
+                "source_rank": 0,
+                "legend_label": "Graph backbone",
+                "suppress_neighborhood_id": True,
+            },
         )
 
     if neigh_id == "hyperedges":
@@ -1712,6 +1756,20 @@ def sparse_to_networkx(
 
         if min_degree > 0:
             node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
+
+        # When the caller passes an explicit mask (i.e. the user
+        # deliberately sampled which ids to show), seed every allowed
+        # node into the degree map - even with degree 0. Otherwise an
+        # isolated vertex (no neighbours in the current adjacency) would
+        # silently disappear from the plot, which is wrong for
+        # adjacency-only views where degree-0 cells are legitimate.
+        if source_allowed is not None:
+            for nid in source_allowed:
+                node_degrees.setdefault(int(nid), 0)
+        if target_allowed is not None:
+            for nid in target_allowed:
+                node_degrees.setdefault(int(nid), 0)
+
         if not node_degrees:
             return None, {}
 
@@ -1932,6 +1990,8 @@ def networkx_to_d3_payload(
     if graph_type == "adjacency":
         via_rank = (relation_context or {}).get("via_rank", src_rank)
         adj_c = rank_color(via_rank)
+        legend_label_override = (relation_context or {}).get("legend_label")
+        suppress_nb_id = bool((relation_context or {}).get("suppress_neighborhood_id"))
         links_out = [
             {
                 "source": str(u),
@@ -1940,6 +2000,8 @@ def networkx_to_d3_payload(
                 "kind": "adjacency",
                 "srcRank": int(src_rank) if src_rank is not None else None,
                 "viaRanks": [int(via_rank)],
+                **({"legendLabel": legend_label_override} if legend_label_override else {}),
+                **({"suppressNeighborhoodId": True} if suppress_nb_id else {}),
             }
             for u, v in G.edges()
         ]
@@ -2189,13 +2251,27 @@ def build_layered_adjacency_networkx(
 
     layers_sorted = sorted(layer_nodes.keys())
     selected = set()
-    if selected_by_rank is not None:
+    # When the caller passes ``selected_by_rank`` the node ids were chosen
+    # deliberately by the user (e.g. a per-rank sample of the current
+    # sample's full population). Those nodes must appear in the graph
+    # even when they have no adjacency edges - otherwise an "isolated"
+    # node is silently hidden, which is confusing for adjacency-only
+    # views where degree-0 vertices are legitimate.
+    selection_is_explicit = selected_by_rank is not None
+    if selection_is_explicit:
+        layers_from_selection = {
+            int(r) for r, ids in selected_by_rank.items() if ids
+        }
+        layers_sorted = sorted(set(layers_sorted) | layers_from_selection)
         for rank in layers_sorted:
             chosen_ids = set(selected_by_rank.get(int(rank), set()))
             for node_id in chosen_ids:
                 lid = _layered_node_id(rank, node_id)
-                if lid in degree:
-                    selected.add(lid)
+                selected.add(lid)
+                # Make sure the (rank, original_id) mapping exists even
+                # for isolated picks that never showed up as an edge
+                # endpoint.
+                layer_nodes.setdefault(int(rank), {}).setdefault(lid, int(node_id))
     else:
         num_layers = max(len(layers_sorted), 1)
         per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
@@ -2225,8 +2301,12 @@ def build_layered_adjacency_networkx(
             via_ranks=sorted(int(x) for x in via_set),
         )
 
-    isolated = [n for n in G.nodes() if G.degree(n) == 0]
-    G.remove_nodes_from(isolated)
+    if not selection_is_explicit:
+        # Auto-pick path: still strip degree-0 leftovers so the view
+        # doesn't fill up with random isolated picks the user did not ask
+        # for. Explicit selection always keeps every picked node.
+        isolated = [n for n in G.nodes() if G.degree(n) == 0]
+        G.remove_nodes_from(isolated)
     if len(G.nodes()) == 0:
         return None, {}, []
 
@@ -2319,13 +2399,25 @@ def build_combined_layered_networkx(
 
     layers_sorted = sorted(layer_nodes.keys())
     selected = set()
-    if selected_by_rank is not None:
+    # When the user has explicitly sampled which ids to show per rank,
+    # those nodes must always make it into the graph - even if they
+    # don't currently participate in any selected incidence or
+    # adjacency. Otherwise picking only adjacencies (or any narrow
+    # neighbourhood subset) silently hides every isolated vertex.
+    selection_is_explicit = selected_by_rank is not None
+    if selection_is_explicit:
+        layers_from_selection = {
+            int(r) for r, ids in selected_by_rank.items() if ids
+        }
+        layers_sorted = sorted(set(layers_sorted) | layers_from_selection)
         for rank in layers_sorted:
             chosen_ids = set(selected_by_rank.get(int(rank), set()))
             for node_id in chosen_ids:
                 lid = _layered_node_id(rank, node_id)
-                if lid in degree:
-                    selected.add(lid)
+                selected.add(lid)
+                # Ensure the (rank, original_id) mapping exists even for
+                # picks that never appeared as an edge endpoint.
+                layer_nodes.setdefault(int(rank), {}).setdefault(lid, int(node_id))
     else:
         num_layers = max(len(layers_sorted), 1)
         per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
@@ -2371,8 +2463,12 @@ def build_combined_layered_networkx(
             via_ranks=sorted(int(x) for x in via_set),
         )
 
-    isolated = [n for n in G.nodes() if G.degree(n) == 0]
-    G.remove_nodes_from(isolated)
+    if not selection_is_explicit:
+        # Auto-pick path keeps the old "trim isolated" safety net so the
+        # view isn't cluttered with leftovers. Explicit selection always
+        # keeps every picked node, isolated or not.
+        isolated = [n for n in G.nodes() if G.degree(n) == 0]
+        G.remove_nodes_from(isolated)
     if len(G.nodes()) == 0:
         return None, {}, []
 
@@ -2491,53 +2587,6 @@ def networkx_to_layered_d3_payload(
         "legend": _build_legend(layers_sorted, rank_labels),
         "relationsLegend": _build_relations_legend(links_out, rank_labels),
     }
-
-
-def launch_html_in_browser(path: Path) -> bool:
-    """
-    Open a local HTML file in a real browser.
-
-    Prefer the OS default browser first (so it matches the user's current choice),
-    then fall back to common browser executables on Windows.
-    """
-    path = path.resolve()
-    try:
-        if webbrowser.open(path.as_uri()):
-            return True
-    except Exception:
-        pass
-
-    if platform.system() == "Windows":
-        candidates = [
-            shutil.which("chrome"),
-            os.environ.get("PROGRAMFILES", "")
-            + r"\Google\Chrome\Application\chrome.exe",
-            os.environ.get("PROGRAMFILES(X86)", "")
-            + r"\Google\Chrome\Application\chrome.exe",
-            shutil.which("msedge"),
-            os.environ.get("PROGRAMFILES(X86)", "")
-            + r"\Microsoft\Edge\Application\msedge.exe",
-            os.environ.get("PROGRAMFILES", "") + r"\Microsoft\Edge\Application\msedge.exe",
-            shutil.which("firefox"),
-            os.environ.get("PROGRAMFILES", "") + r"\Mozilla Firefox\firefox.exe",
-        ]
-        for exe in candidates:
-            if not exe:
-                continue
-            exe_path = Path(exe)
-            if not exe_path.exists():
-                continue
-            try:
-                subprocess.Popen([str(exe_path), str(path)], close_fds=True)
-                return True
-            except Exception:
-                continue
-        try:
-            os.startfile(str(path))  # noqa: S606
-            return True
-        except Exception:
-            pass
-    return False
 
 
 # ============================================================================
