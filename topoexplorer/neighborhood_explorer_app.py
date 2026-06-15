@@ -487,17 +487,32 @@ def _build_relations_legend(links_out, rank_labels=None):
             src_rank = link.get("srcRank")
             if src_rank is None:
                 src_rank = via
-            key = ("adjacency", int(src_rank) if src_rank is not None else None, via)
+            # Pseudo-neighborhoods (e.g. ``"graph"`` for the pairwise
+            # edge_index backbone) carry an explicit legend label and
+            # disable the technical neighborhood-id prefix so the entry
+            # reads as e.g. ``"Graph backbone"`` instead of the
+            # awkward ``"0-up_adjacency-0: Nodes ↔ Nodes via Nodes"``.
+            override_label = link.get("legendLabel")
+            suppress_nb_id = bool(link.get("suppressNeighborhoodId"))
+            key = (
+                "adjacency",
+                int(src_rank) if src_rank is not None else None,
+                via,
+                override_label or "",
+            )
             if key in seen:
                 continue
             seen.add(key)
             color = link.get("color") or (rank_color(via) if via is not None else "#888888")
             src_color = rank_color(src_rank) if src_rank is not None else "#888888"
-            nb_id = _neighborhood_id_for_adjacency(src_rank, via)
-            term = _cells_term(src_rank)
-            via_term = _cells_term(via)
-            body = f"{term} ↔ {term} via {via_term}"
-            label = f"{nb_id}: {body}" if nb_id else body
+            nb_id = None if suppress_nb_id else _neighborhood_id_for_adjacency(src_rank, via)
+            if override_label:
+                label = override_label
+            else:
+                term = _cells_term(src_rank)
+                via_term = _cells_term(via)
+                body = f"{term} ↔ {term} via {via_term}"
+                label = f"{nb_id}: {body}" if nb_id else body
             out.append({
                 "kind": "adjacency",
                 "srcRank": src_rank,
@@ -543,9 +558,25 @@ def _build_relations_legend(links_out, rank_labels=None):
 
 
 def _build_legend(ranks, rank_labels=None):
-    """Legend entries: list of ``{rank, color, label}`` for the given ranks."""
+    """Legend entries: list of ``{rank, color, label}`` for the given ranks.
+
+    When ``rank_labels`` describes more ranks than ``ranks`` does (e.g. the
+    dataset has cells up to faces but the current view only contains
+    rank-0 nodes), we *always* include every known rank in the legend.
+    Adjacency edges colour themselves by their mediating via-rank, so the
+    user can encounter rank colours that don't correspond to any node
+    layer currently on screen; showing all dataset ranks keeps those
+    colour-to-rank associations visible.
+    """
+    rank_set = {int(x) for x in ranks}
+    if rank_labels:
+        for r in rank_labels.keys():
+            try:
+                rank_set.add(int(r))
+            except (TypeError, ValueError):
+                continue
     out = []
-    for r in sorted({int(x) for x in ranks}):
+    for r in sorted(rank_set):
         out.append({
             "rank": r,
             "color": rank_color(r),
@@ -1033,10 +1064,21 @@ def get_named_visualization_matrix(data, neigh_id):
         adj = edge_index_to_sparse_adj(data)
         if adj is None:
             return None, None, None
+        # ``"graph"`` is a pseudo-neighborhood (the raw pairwise edge_index)
+        # rather than a topobench operator. The default adjacency legend
+        # template ("0-up_adjacency-0: Nodes ↔ Nodes via Nodes") reads
+        # oddly here because there's no real mediating rank, so we pin
+        # a custom label and signal that no canonical id should be
+        # displayed for the entry.
         return (
             adj,
             "Graph (adjacency from edge_index)",
-            {"type": "adjacency", "source_rank": 0},
+            {
+                "type": "adjacency",
+                "source_rank": 0,
+                "legend_label": "Graph backbone",
+                "suppress_neighborhood_id": True,
+            },
         )
 
     if neigh_id == "hyperedges":
@@ -1697,6 +1739,8 @@ def networkx_to_d3_payload(
     if graph_type == "adjacency":
         via_rank = (relation_context or {}).get("via_rank", src_rank)
         adj_c = rank_color(via_rank)
+        legend_label_override = (relation_context or {}).get("legend_label")
+        suppress_nb_id = bool((relation_context or {}).get("suppress_neighborhood_id"))
         links_out = [
             {
                 "source": str(u),
@@ -1705,6 +1749,8 @@ def networkx_to_d3_payload(
                 "kind": "adjacency",
                 "srcRank": int(src_rank) if src_rank is not None else None,
                 "viaRanks": [int(via_rank)],
+                **({"legendLabel": legend_label_override} if legend_label_override else {}),
+                **({"suppressNeighborhoodId": True} if suppress_nb_id else {}),
             }
             for u, v in G.edges()
         ]
