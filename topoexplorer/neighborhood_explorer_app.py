@@ -1463,6 +1463,20 @@ def sparse_to_networkx(
 
         if min_degree > 0:
             node_degrees = {k: v for k, v in node_degrees.items() if v >= min_degree}
+
+        # When the caller passes an explicit mask (i.e. the user
+        # deliberately sampled which ids to show), seed every allowed
+        # node into the degree map - even with degree 0. Otherwise an
+        # isolated vertex (no neighbours in the current adjacency) would
+        # silently disappear from the plot, which is wrong for
+        # adjacency-only views where degree-0 cells are legitimate.
+        if source_allowed is not None:
+            for nid in source_allowed:
+                node_degrees.setdefault(int(nid), 0)
+        if target_allowed is not None:
+            for nid in target_allowed:
+                node_degrees.setdefault(int(nid), 0)
+
         if not node_degrees:
             return None, {}
 
@@ -1940,13 +1954,27 @@ def build_layered_adjacency_networkx(
 
     layers_sorted = sorted(layer_nodes.keys())
     selected = set()
-    if selected_by_rank is not None:
+    # When the caller passes ``selected_by_rank`` the node ids were chosen
+    # deliberately by the user (e.g. a per-rank sample of the current
+    # sample's full population). Those nodes must appear in the graph
+    # even when they have no adjacency edges - otherwise an "isolated"
+    # node is silently hidden, which is confusing for adjacency-only
+    # views where degree-0 vertices are legitimate.
+    selection_is_explicit = selected_by_rank is not None
+    if selection_is_explicit:
+        layers_from_selection = {
+            int(r) for r, ids in selected_by_rank.items() if ids
+        }
+        layers_sorted = sorted(set(layers_sorted) | layers_from_selection)
         for rank in layers_sorted:
             chosen_ids = set(selected_by_rank.get(int(rank), set()))
             for node_id in chosen_ids:
                 lid = _layered_node_id(rank, node_id)
-                if lid in degree:
-                    selected.add(lid)
+                selected.add(lid)
+                # Make sure the (rank, original_id) mapping exists even
+                # for isolated picks that never showed up as an edge
+                # endpoint.
+                layer_nodes.setdefault(int(rank), {}).setdefault(lid, int(node_id))
     else:
         num_layers = max(len(layers_sorted), 1)
         per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
@@ -1976,8 +2004,12 @@ def build_layered_adjacency_networkx(
             via_ranks=sorted(int(x) for x in via_set),
         )
 
-    isolated = [n for n in G.nodes() if G.degree(n) == 0]
-    G.remove_nodes_from(isolated)
+    if not selection_is_explicit:
+        # Auto-pick path: still strip degree-0 leftovers so the view
+        # doesn't fill up with random isolated picks the user did not ask
+        # for. Explicit selection always keeps every picked node.
+        isolated = [n for n in G.nodes() if G.degree(n) == 0]
+        G.remove_nodes_from(isolated)
     if len(G.nodes()) == 0:
         return None, {}, []
 
@@ -2070,13 +2102,25 @@ def build_combined_layered_networkx(
 
     layers_sorted = sorted(layer_nodes.keys())
     selected = set()
-    if selected_by_rank is not None:
+    # When the user has explicitly sampled which ids to show per rank,
+    # those nodes must always make it into the graph - even if they
+    # don't currently participate in any selected incidence or
+    # adjacency. Otherwise picking only adjacencies (or any narrow
+    # neighbourhood subset) silently hides every isolated vertex.
+    selection_is_explicit = selected_by_rank is not None
+    if selection_is_explicit:
+        layers_from_selection = {
+            int(r) for r, ids in selected_by_rank.items() if ids
+        }
+        layers_sorted = sorted(set(layers_sorted) | layers_from_selection)
         for rank in layers_sorted:
             chosen_ids = set(selected_by_rank.get(int(rank), set()))
             for node_id in chosen_ids:
                 lid = _layered_node_id(rank, node_id)
-                if lid in degree:
-                    selected.add(lid)
+                selected.add(lid)
+                # Ensure the (rank, original_id) mapping exists even for
+                # picks that never appeared as an edge endpoint.
+                layer_nodes.setdefault(int(rank), {}).setdefault(lid, int(node_id))
     else:
         num_layers = max(len(layers_sorted), 1)
         per_layer_cap = max(1, math.ceil(max_nodes / num_layers))
@@ -2122,8 +2166,12 @@ def build_combined_layered_networkx(
             via_ranks=sorted(int(x) for x in via_set),
         )
 
-    isolated = [n for n in G.nodes() if G.degree(n) == 0]
-    G.remove_nodes_from(isolated)
+    if not selection_is_explicit:
+        # Auto-pick path keeps the old "trim isolated" safety net so the
+        # view isn't cluttered with leftovers. Explicit selection always
+        # keeps every picked node, isolated or not.
+        isolated = [n for n in G.nodes() if G.degree(n) == 0]
+        G.remove_nodes_from(isolated)
     if len(G.nodes()) == 0:
         return None, {}, []
 
