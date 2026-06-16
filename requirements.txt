@@ -1,7 +1,24 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 --find-links https://data.pyg.org/whl/torch-2.3.0+cpu.html
 
-# Pin the CPU build explicitly so pip does not pull a CUDA wheel from PyPI
+# Pin the CPU build explicitly so pip does not pull a CUDA wheel from PyPI.
 torch==2.3.0+cpu
+
+# PyG companion wheels matched to torch 2.3.0 + Python 3.11 (CPU only).
+# Pinning these explicitly avoids the multi-minute source compile that pip
+# falls back to when transitive resolution can't find a matching wheel,
+# which routinely times out on Streamlit Community Cloud's free tier.
+torch-scatter==2.1.2+pt23cpu
+torch-sparse==0.6.18+pt23cpu
+torch-cluster==1.6.3+pt23cpu
+
+# Topobench is installed from git because it is not on PyPI; pip will pull
+# its remaining transitive dependencies from PyPI in the same resolve step.
 topobench @ git+https://github.com/geometric-intelligence/topobench.git
-streamlit
+
+# Streamlit + helpers used directly by the app.
+streamlit>=1.36,<2
+networkx>=3,<4
+omegaconf>=2.3,<3
+rootutils>=1.0,<2
+PyYAML>=6

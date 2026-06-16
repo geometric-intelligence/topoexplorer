@@ -355,7 +355,6 @@ def blend_hex(*hex_colors):
 
 
 NEIGHBORHOOD_COLOR_MODES = ("rank_gradient", "unique_solid")
-_LEGEND_NEUTRAL = "#bbbbbb"
 
 
 def _neighborhood_color_kind(nb_id):
@@ -692,14 +691,21 @@ def _build_relations_legend(
         tgt_term = _cells_term(tgt_rank, target_kind=target_kind)
         body = f"{src_term} → {tgt_term}"
         label = f"{nb_id}: {body}" if nb_id else body
+        # Endpoint circles always mirror the rank colors of the actual
+        # plot nodes (e.g. rank-0 blue, rank-1 orange). Only the *line*
+        # color differs between modes: a per-neighborhood solid in
+        # unique-solid mode, the rank-to-rank gradient otherwise. This
+        # keeps the glyph readable against the plot in both modes.
+        src_endpoint = rank_color(src_rank) if src_rank is not None else "#888888"
+        tgt_endpoint = rank_color(tgt_rank) if tgt_rank is not None else "#888888"
         if solid:
             solid_c = _solid_for_nb(nb_id, color)
             out.append({
                 "kind": "incidence",
                 "srcRank": src_rank,
                 "tgtRank": tgt_rank,
-                "srcColor": _LEGEND_NEUTRAL,
-                "tgtColor": _LEGEND_NEUTRAL,
+                "srcColor": src_endpoint,
+                "tgtColor": tgt_endpoint,
                 "color": solid_c,
                 "direction": direction,
                 "neighborhoodId": nb_id,
@@ -710,8 +716,8 @@ def _build_relations_legend(
                 "kind": "incidence",
                 "srcRank": src_rank,
                 "tgtRank": tgt_rank,
-                "srcColor": rank_color(src_rank) if src_rank is not None else "#888888",
-                "tgtColor": rank_color(tgt_rank) if tgt_rank is not None else "#888888",
+                "srcColor": src_endpoint,
+                "tgtColor": tgt_endpoint,
                 "colorStart": color_start,
                 "colorEnd": color_end,
                 "color": color,
@@ -752,12 +758,16 @@ def _build_relations_legend(
                 nb_id = None
             else:
                 nb_id = link.get("neighborhoodId") or _neighborhood_id_for_adjacency(src_rank, via)
+            # Endpoint circles in the legend always mirror the actual
+            # plot's rank colour for ``src_rank`` (adjacencies are
+            # within-rank, so both endpoints share the same colour). Only
+            # the line colour changes between modes: solid per-neighborhood
+            # in unique-solid mode, mediating via-rank colour otherwise.
+            src_color = rank_color(src_rank) if src_rank is not None else "#888888"
             if solid:
                 color = _solid_for_nb(nb_id, link.get("color") or "#888888")
-                src_color = _LEGEND_NEUTRAL
             else:
                 color = link.get("color") or (rank_color(via) if via is not None else "#888888")
-                src_color = rank_color(src_rank) if src_rank is not None else "#888888"
             if override_label:
                 label = override_label
             else:

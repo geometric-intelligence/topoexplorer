@@ -1,0 +1,45 @@
+# Streamlit configuration tuned for Community Cloud deployment.
+# These settings can be overridden per-deployment via the Cloud "Advanced
+# settings" panel if you need to experiment without editing the repo.
+
+[server]
+# Cloud always runs headless; keeping this here so local `streamlit run`
+# behaves the same way and we don't accidentally pop a browser tab from a
+# CI runner.
+headless = true
+# 50 MB is plenty for the small graph-data uploads the app currently
+# supports and well under Cloud's hard limit.
+maxUploadSize = 50
+# Trim CORS surface; the app is self-contained and doesn't talk to any
+# cross-origin backend from the browser.
+enableCORS = true
+enableXsrfProtection = true
+# Auto-rerun every open browser session whenever a source file changes.
+# Convenient during the review period so iterative tweaks reach the live
+# URL without needing to manually click "Rerun" in each browser tab. The
+# trade-off is that a reviewer who happens to be viewing during a save
+# will see a brief "Running…" indicator. Set to false (or delete) once
+# the review window closes and the app is "frozen".
+runOnSave = true
+
+[browser]
+# Do not phone home with usage stats from a public Cloud deployment.
+gatherUsageStats = false
+
+[theme]
+# Light theme keeps the D3 chart background (#fafafa) consistent with the
+# rest of the page on all viewers.
+base = "light"
+
+[client]
+# When self-hosting from a personal machine, full error tracebacks would
+# expose absolute filesystem paths (incl. the OS username) to any visitor
+# that triggers an unhandled exception. Keep them server-side only.
+showErrorDetails = false
+# The default "auto" toolbar leaks a "View source" link to the GitHub repo
+# and a "Manage app" link to Streamlit Cloud. "viewer" hides both so the
+# public anonymous deployment doesn't advertise where the app is hosted.
+toolbarMode = "viewer"
+
+[runner]
+fastReruns = true
