@@ -225,7 +225,9 @@ def build_standalone_d3_html(
           var defsParts = [];
           var lineExtra = '';
           var lineX2 = x2;
-          if (rel.kind === "incidence") {
+          var solidMode = (payload.neighborhoodColorMode === "unique_solid")
+            || !(rel.colorStart && rel.colorEnd);
+          if (rel.kind === "incidence" && !solidMode) {
             var gradId = "lglegrad-" + idx;
             var arrowId = "lglegarrow-" + idx;
             defsParts.push(
@@ -249,7 +251,19 @@ def build_standalone_d3_html(
             // the target circle border, not buried inside it.
             lineX2 = x2 - 1;
           } else {
-            lineExtra = ' stroke="' + escAttr(rel.color || "#888") + '"';
+            var strokeColor = rel.color || "#888888";
+            lineExtra = ' stroke="' + escAttr(strokeColor) + '"';
+            if (rel.kind === "incidence") {
+              var arrowIdSolid = "lglegarrow-solid-" + idx;
+              defsParts.push(
+                '<marker id="' + arrowIdSolid + '" viewBox="0 -5 10 10" refX="9"'
+                + ' refY="0" markerWidth="7" markerHeight="7" orient="auto">'
+                + '<path d="M0,-4L8,0L0,4Z" fill="' + escAttr(strokeColor)
+                + '" opacity="0.92"/></marker>'
+              );
+              lineExtra += ' marker-end="url(#' + arrowIdSolid + ')"';
+              lineX2 = x2 - 1;
+            }
           }
           return '<svg width="' + W + '" height="' + H
             + '" viewBox="0 0 ' + W + ' ' + H + '">'
@@ -601,6 +615,7 @@ def build_standalone_d3_html(
       }
 
       const nodeById = new Map(nodes.map(function(d) { return [String(d.id), d]; }));
+      const solidNeighborhoodColors = (payload.neighborhoodColorMode === "unique_solid");
       const links = (payload.links || []).map(function(l, idx) {
         const s = nodeById.get(String(l.source));
         const t = nodeById.get(String(l.target));
@@ -614,7 +629,8 @@ def build_standalone_d3_html(
           metrics: l.metrics,
           _parallelSlot: l._parallelSlot || 0,
           _parallelCount: l._parallelCount || 1,
-          _gradId: (l.colorStart && l.colorEnd) ? ("grad-link-" + idx) : null
+          _gradId: (l.colorStart && l.colorEnd && !solidNeighborhoodColors)
+            ? ("grad-link-" + idx) : null
         };
       }).filter(function(l) { return l.source && l.target; });
 

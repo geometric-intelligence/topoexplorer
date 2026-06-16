@@ -354,6 +354,223 @@ def blend_hex(*hex_colors):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+NEIGHBORHOOD_COLOR_MODES = ("rank_gradient", "unique_solid")
+_LEGEND_NEUTRAL = "#bbbbbb"
+
+
+def _neighborhood_color_kind(nb_id):
+    """Classify a neighborhood id for colormap sampling (adjacency vs incidence)."""
+    if nb_id in ("graph",):
+        return "adjacency"
+    if nb_id in ("hyperedges", "incidence_hyperedges"):
+        return "incidence"
+    if nb_id.startswith("adjacency_"):
+        return "adjacency"
+    if nb_id.startswith("incidence_"):
+        return "incidence"
+    try:
+        _r, _direction, ntype, _src = parse_neighborhood(nb_id)
+        return "adjacency" if ntype == "adjacency" else "incidence"
+    except Exception:
+        return "incidence"
+
+
+# Solid neighborhood colours: cool viridis band vs warm inferno band (no shared
+# dark-purple anchors). Golden-ratio sampling spreads hues when many are selected.
+_ADJacency_CMAP = "viridis"
+_ADJacency_CMAP_RANGE = (0.38, 0.82)  # teal → green; skip pale yellow end
+_INCIDENCE_CMAP = "inferno"
+_INCIDENCE_CMAP_RANGE = (0.48, 0.86)  # red → orange; skip pale yellow end
+
+
+def _sample_colormap_hex(cmap_name, n, *, start=0.12, end=0.88, spread="golden"):
+    """Sample ``n`` distinct hex colors from a matplotlib colormap.
+
+    With ``spread="golden"``, positions are golden-ratio spaced within
+    ``[start, end]`` so consecutive neighborhoods are less likely to look alike.
+    """
+    if n <= 0:
+        return []
+    import matplotlib.colors as mcolors
+    import numpy as np
+
+    try:
+        from matplotlib import colormaps
+
+        cmap = colormaps[cmap_name]
+    except Exception:
+        import matplotlib.pyplot as plt
+
+        cmap = plt.get_cmap(cmap_name)
+    if n == 1:
+        mid = (start + end) / 2.0
+        return [mcolors.to_hex(cmap(mid))]
+    span = end - start
+    if spread == "golden" and n > 2:
+        phi = 0.618033988749895
+        ts = sorted(start + ((i * phi) % 1.0) * span for i in range(n))
+    else:
+        ts = np.linspace(start, end, n)
+    return [mcolors.to_hex(cmap(float(t))) for t in ts]
+
+
+def _build_neighborhood_color_map(neigh_ids):
+    """Assign one solid color per selected neighborhood (cool vs warm bands)."""
+    adj_ids = [nid for nid in neigh_ids if _neighborhood_color_kind(nid) == "adjacency"]
+    inc_ids = [nid for nid in neigh_ids if _neighborhood_color_kind(nid) == "incidence"]
+    adj_lo, adj_hi = _ADJacency_CMAP_RANGE
+    inc_lo, inc_hi = _INCIDENCE_CMAP_RANGE
+    adj_colors = _sample_colormap_hex(
+        _ADJacency_CMAP, len(adj_ids), start=adj_lo, end=adj_hi,
+    )
+    inc_colors = _sample_colormap_hex(
+        _INCIDENCE_CMAP, len(inc_ids), start=inc_lo, end=inc_hi,
+    )
+    out = {}
+    for nid, color in zip(adj_ids, adj_colors):
+        out[nid] = color
+    for nid, color in zip(inc_ids, inc_colors):
+        out[nid] = color
+    return out
+
+
+def _expand_neighborhood_color_aliases(neigh_ids, color_map):
+    """Map canonical reconstructed ids and basic ``incidence_k`` aliases to colors."""
+    expanded = dict(color_map)
+    for nid in neigh_ids:
+        color = color_map.get(nid)
+        if not color:
+            continue
+        expanded[nid] = color
+        if nid.startswith("incidence_"):
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                continue
+            src = max(k - 1, 0)
+            expanded[f"1-up_incidence-{src}"] = color
+        elif nid.startswith("adjacency_"):
+            try:
+                k = int(nid.split("_", 1)[1])
+            except ValueError:
+                continue
+            expanded[f"1-up_adjacency-{k}"] = color
+            expanded[f"adjacency-{k}"] = color
+    return expanded
+
+
+def _resolve_link_neighborhood_id(link, neigh_ids):
+    """Best-effort match from a rendered link back to a selected neighborhood id."""
+    selected = set(neigh_ids)
+    if link.get("neighborhoodId") in selected:
+        return link["neighborhoodId"]
+
+    kind = link.get("kind") or "incidence"
+    if kind == "adjacency":
+        via_ranks = link.get("viaRanks") or []
+        via = int(via_ranks[0]) if via_ranks else link.get("srcRank")
+        src = link.get("srcRank")
+        canon = _neighborhood_id_for_adjacency(src, via)
+        if canon in selected:
+            return canon
+        for nid in neigh_ids:
+            if _neighborhood_color_kind(nid) != "adjacency":
+                continue
+            cls = _classify_id_simple(nid)
+            if cls and cls[1] == src and cls[2] == via:
+                return nid
+    else:
+        direction = link.get("direction") or "up"
+        src = link.get("srcRank")
+        tgt = link.get("tgtRank")
+        canon = _neighborhood_id_for_incidence(src, tgt, direction)
+        if canon in selected:
+            return canon
+        if direction == "both":
+            lo, hi = sorted((int(src), int(tgt)))
+            for cand_dir in ("up", "down"):
+                alt = _neighborhood_id_for_incidence(lo, hi, cand_dir)
+                if alt in selected:
+                    return alt
+        for nid in neigh_ids:
+            if _neighborhood_color_kind(nid) != "incidence":
+                continue
+            cls = _classify_id_simple(nid)
+            if not cls or cls[0] != "incidence":
+                continue
+            lo, hi = sorted((int(src), int(tgt)))
+            if cls[1] == lo and cls[2] == hi:
+                return nid
+
+    if len(neigh_ids) == 1:
+        return neigh_ids[0]
+    return None
+
+
+def _classify_id_simple(nid):
+    """Lightweight ``(kind, a, b)`` classifier for color aliasing (no data required)."""
+    if nid.startswith("incidence_") and nid != "incidence_hyperedges":
+        try:
+            k = int(nid.split("_", 1)[1])
+        except ValueError:
+            return None
+        if k <= 0:
+            return None
+        return ("incidence", max(k - 1, 0), k)
+    if nid.startswith("adjacency_"):
+        try:
+            k = int(nid.split("_", 1)[1])
+        except ValueError:
+            return None
+        return ("adjacency", k, k + 1)
+    if "-" in nid:
+        try:
+            _r, _direction, ntype, _src = parse_neighborhood(nid)
+        except Exception:
+            return None
+        if ntype == "adjacency":
+            via = _src + _r if _direction == "up" else _src - _r
+            return ("adjacency", _src, via)
+        tgt = _neighborhood_target_rank(nid)
+        lo, hi = sorted((_src, tgt))
+        return ("incidence", lo, hi)
+    if nid in ("graph",):
+        return ("adjacency", 0, 1)
+    if nid in ("hyperedges", "incidence_hyperedges"):
+        return ("incidence", 0, 1)
+    return None
+
+
+def _apply_neighborhood_color_mode(payload, neigh_ids, color_mode):
+    """Apply rank-gradient (default) or unique-solid neighborhood edge colors."""
+    if not payload:
+        return
+    if color_mode != "unique_solid" or not neigh_ids:
+        payload["neighborhoodColorMode"] = "rank_gradient"
+        return
+
+    color_map = _build_neighborhood_color_map(neigh_ids)
+    expanded = _expand_neighborhood_color_aliases(neigh_ids, color_map)
+
+    for link in payload.get("links") or []:
+        nb_id = _resolve_link_neighborhood_id(link, neigh_ids)
+        solid = expanded.get(nb_id) if nb_id else None
+        if solid is None and len(neigh_ids) == 1:
+            solid = color_map.get(neigh_ids[0])
+        if not solid:
+            continue
+        link["color"] = solid
+        link["neighborhoodId"] = nb_id or neigh_ids[0]
+        link.pop("colorStart", None)
+        link.pop("colorEnd", None)
+
+    payload["neighborhoodColorMode"] = "unique_solid"
+    payload["relationsLegend"] = _build_relations_legend(
+        payload.get("links"),
+        color_mode="unique_solid",
+        solid_color_map=expanded,
+    )
+
 _FRIENDLY_RANK_NAMES = {0: "Nodes", 1: "Edges", 2: "Faces", 3: "Volumes"}
 
 
@@ -430,14 +647,21 @@ def _neighborhood_id_for_adjacency(src_rank, via_rank):
     return f"adjacency-{s}"
 
 
-def _build_relations_legend(links_out, rank_labels=None):
+def _build_relations_legend(
+    links_out,
+    rank_labels=None,
+    *,
+    color_mode="rank_gradient",
+    solid_color_map=None,
+):
     """Aggregate per-link metadata in ``links_out`` into legend rows.
 
     Returns one entry per unique relation rendered, with enough data for
     the JS renderer to draw a small two-node + edge glyph that mirrors
-    the actual plot (gradient + directional arrow for incidences, solid
-    colour for adjacencies). Each row's label combines the canonical
-    neighborhood id with cell-dimension terminology, e.g.
+    the actual plot (gradient + directional arrow for incidences in
+    rank-gradient mode; solid colour per neighborhood in unique-solid mode).
+    Each row's label combines the canonical neighborhood id with
+    cell-dimension terminology, e.g.
     ``"2-down_incidence-2: Faces → Nodes"`` or
     ``"1-up_adjacency-0: Nodes ↔ Nodes via Edges"``.
     """
@@ -446,8 +670,16 @@ def _build_relations_legend(links_out, rank_labels=None):
     # terminology requested by the user, so the parameter is unused here.
     del rank_labels
 
+    solid = color_mode == "unique_solid"
+    solid_color_map = solid_color_map or {}
+
     seen = set()
     out = []
+
+    def _solid_for_nb(nb_id, fallback):
+        if nb_id and nb_id in solid_color_map:
+            return solid_color_map[nb_id]
+        return fallback
 
     def _emit_incidence(src_rank, tgt_rank, direction, *,
                         color, color_start, color_end, target_kind):
@@ -460,19 +692,33 @@ def _build_relations_legend(links_out, rank_labels=None):
         tgt_term = _cells_term(tgt_rank, target_kind=target_kind)
         body = f"{src_term} → {tgt_term}"
         label = f"{nb_id}: {body}" if nb_id else body
-        out.append({
-            "kind": "incidence",
-            "srcRank": src_rank,
-            "tgtRank": tgt_rank,
-            "srcColor": rank_color(src_rank) if src_rank is not None else "#888888",
-            "tgtColor": rank_color(tgt_rank) if tgt_rank is not None else "#888888",
-            "colorStart": color_start,
-            "colorEnd": color_end,
-            "color": color,
-            "direction": direction,
-            "neighborhoodId": nb_id,
-            "label": label,
-        })
+        if solid:
+            solid_c = _solid_for_nb(nb_id, color)
+            out.append({
+                "kind": "incidence",
+                "srcRank": src_rank,
+                "tgtRank": tgt_rank,
+                "srcColor": _LEGEND_NEUTRAL,
+                "tgtColor": _LEGEND_NEUTRAL,
+                "color": solid_c,
+                "direction": direction,
+                "neighborhoodId": nb_id,
+                "label": label,
+            })
+        else:
+            out.append({
+                "kind": "incidence",
+                "srcRank": src_rank,
+                "tgtRank": tgt_rank,
+                "srcColor": rank_color(src_rank) if src_rank is not None else "#888888",
+                "tgtColor": rank_color(tgt_rank) if tgt_rank is not None else "#888888",
+                "colorStart": color_start,
+                "colorEnd": color_end,
+                "color": color,
+                "direction": direction,
+                "neighborhoodId": nb_id,
+                "label": label,
+            })
 
     for link in links_out or []:
         kind = link.get("kind") or "incidence"
@@ -502,9 +748,16 @@ def _build_relations_legend(links_out, rank_labels=None):
             if key in seen:
                 continue
             seen.add(key)
-            color = link.get("color") or (rank_color(via) if via is not None else "#888888")
-            src_color = rank_color(src_rank) if src_rank is not None else "#888888"
-            nb_id = None if suppress_nb_id else _neighborhood_id_for_adjacency(src_rank, via)
+            if suppress_nb_id:
+                nb_id = None
+            else:
+                nb_id = link.get("neighborhoodId") or _neighborhood_id_for_adjacency(src_rank, via)
+            if solid:
+                color = _solid_for_nb(nb_id, link.get("color") or "#888888")
+                src_color = _LEGEND_NEUTRAL
+            else:
+                color = link.get("color") or (rank_color(via) if via is not None else "#888888")
+                src_color = rank_color(src_rank) if src_rank is not None else "#888888"
             if override_label:
                 label = override_label
             else:
@@ -554,7 +807,6 @@ def _build_relations_legend(links_out, rank_labels=None):
                     color_end=color_end, target_kind=target_kind,
                 )
     return out
-
 
 def _build_legend(ranks, rank_labels=None):
     """Legend entries: list of ``{rank, color, label}`` for the given ranks.
@@ -3124,6 +3376,22 @@ def _on_layered_3d_toggle():
     _rebuild_embed_for_neighborhoods(ids)
 
 
+def _on_color_by_rank_toggle():
+    """Re-embed when toggling rank-gradient vs unique-solid neighborhood colors."""
+    if st.session_state.get("data") is None:
+        return
+    ids = list(st.session_state.get("selected_neighborhood_ids") or [])
+    if not ids:
+        return
+    _rebuild_embed_for_neighborhoods(ids)
+
+
+def _neighborhood_color_mode_from_session():
+    """Return ``rank_gradient`` or ``unique_solid`` from the Explore-tab toggle."""
+    if st.session_state.get("color_neighborhoods_by_rank", False):
+        return "rank_gradient"
+    return "unique_solid"
+
 def _on_metrics_option_change():
     """Re-embed when a metrics toggle changes (HUD visibility / advanced compute)."""
     if st.session_state.get("data") is None:
@@ -3666,6 +3934,8 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     cache_marker = "+".join(neigh_ids)
     if st.session_state.get("layered_3d_view"):
         cache_marker += ":3d"
+    color_mode = _neighborhood_color_mode_from_session()
+    cache_marker += f":colors:{color_mode}"
 
     dataset_name = st.session_state.get("dataset_name") or "—"
     num_nodes = _node_count_from_dataset(dset0)
@@ -3674,6 +3944,7 @@ def _rebuild_embed_for_neighborhoods(neigh_ids):
     )
     payload["subtitle"] = ""
 
+    _apply_neighborhood_color_mode(payload, neigh_ids, color_mode)
     _compute_and_attach_metrics(payload, G_load, neigh_ids)
 
     embed_html = build_standalone_d3_html(
@@ -4421,6 +4692,7 @@ def _render_explore_tab():
     _render_neighborhood_picker()
 
     st.divider()
+    st.session_state.setdefault("color_neighborhoods_by_rank", False)
     st.toggle(
         "3D layered view (orbit/zoom)",
         help=(
@@ -4429,6 +4701,16 @@ def _render_explore_tab():
         ),
         key="layered_3d_view",
         on_change=_on_layered_3d_toggle,
+    )
+    st.toggle(
+        "Color neighborhoods by rank information",
+        help=(
+            "When off (default), each selected neighborhood is drawn in one solid "
+            "colour (adjacency: cool greens/teals; incidence: warm oranges/yellows). "
+            "When on, edges use rank-based gradients between source and target ranks."
+        ),
+        key="color_neighborhoods_by_rank",
+        on_change=_on_color_by_rank_toggle,
     )
 
     st.divider()
@@ -4785,6 +5067,9 @@ def main():
     # "Use lifting" toggle defaults to on for first-time visitors.
     if "use_lifting" not in st.session_state:
         st.session_state["use_lifting"] = True
+
+    if "layered_3d_view" not in st.session_state:
+        st.session_state["layered_3d_view"] = True
 
     data_loaded = st.session_state.get("data") is not None
 
