@@ -1,0 +1,8 @@
+TopoExplorer
+Copyright (c) 2024 TopoExplorer Team
+
+TopoExplorer is built on top of TopoBench
+(https://github.com/geometric-intelligence/topobench), which is licensed under
+the MIT License. The brand accent colours used in the app and in the exported
+HTML files are inspired by the TopoBench visual identity, in acknowledgement of
+that dependency.

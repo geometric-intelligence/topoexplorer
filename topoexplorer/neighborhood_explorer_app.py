@@ -26,6 +26,8 @@ import torch
 
 from d3_graph_html import build_standalone_d3_html
 import graph_metrics as gm
+import branding
+import stats_html
 from omegaconf import OmegaConf
 from torch_geometric.utils import to_undirected
 import rootutils
@@ -238,11 +240,25 @@ st.markdown(
         z-index: 10;
         background: transparent;
     }}
+    .topo-sidebar-brand {{
+        text-align: center;
+        margin: 0.5rem 2.25rem 0.75rem 2.25rem;
+    }}
     .topo-sidebar-title {{
         text-align: center;
-        margin: 0.5rem 2.25rem 0.5rem 2.25rem;
-        font-size: 1.35rem;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 1.4rem;
         font-weight: 700;
+        color: {branding.BRAND["ink"]};
+        line-height: 1.1;
+    }}
+    .topo-sidebar-tagline {{
+        text-align: center;
+        font-size: 0.72rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-top: 0.15rem;
+        color: {branding.BRAND["muted"]};
     }}
     [data-testid="stSidebarHeader"] {{
         min-height: 0;
@@ -5043,6 +5059,124 @@ def _render_metrics_tab():
         if not flags.get("expensive"):
             st.caption("Enable to add per-node/edge centralities to tooltips and tables.")
 
+    stats_doc = _build_stats_html(metrics)
+    if stats_doc:
+        st.download_button(
+            label="Download stats (HTML)",
+            data=stats_doc,
+            file_name="topobench_metrics.html",
+            mime="text/html",
+            key="stats_download_main",
+            width="stretch",
+        )
+
+
+def _build_stats_html(metrics):
+    """Assemble the standalone stats HTML for the current view.
+
+    Reuses the already-computed metric tables (whole-graph summary, selected
+    neighborhood structural metrics, top nodes and Forman-Ricci extremes) plus
+    the dataset metadata, and renders them as a branded, self-contained page via
+    :func:`stats_html.build_stats_html`.
+
+    Args:
+        metrics: The metrics dict from ``st.session_state["_graph_metrics"]``.
+
+    Returns:
+        str | None: The HTML document, or ``None`` if no metrics are available.
+    """
+    if not metrics:
+        return None
+
+    domain = st.session_state.get("cfg_domain")
+    dataset_name = st.session_state.get("dataset_name")
+    meta = (
+        extract_dataset_metadata(domain, dataset_name)
+        if domain and dataset_name
+        else {}
+    )
+    num_nodes = _node_count_from_dataset(st.session_state.get("data"))
+    num_graphs = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+
+    payload = st.session_state.get("_d3_payload") or {}
+    title = payload.get("title") or (dataset_name or "TopoExplorer")
+    subtitle = payload.get("subtitle") or ""
+
+    num_classes = meta.get("num_classes")
+    sections = [
+        {
+            "heading": "Dataset",
+            "columns": ["Field", "Value"],
+            "rows": [
+                ["Domain", domain or "N/A"],
+                ["Dataset", dataset_name or "N/A"],
+                ["Nodes (displayed graph)",
+                 num_nodes if num_nodes is not None else "N/A"],
+                ["Number of graphs", num_graphs],
+                ["Task", meta.get("task") or "N/A"],
+                ["Task level", meta.get("task_level") or "N/A"],
+                ["Learning setting", meta.get("learning_setting") or "N/A"],
+                ["Num features", _format_num_features(meta.get("num_features"))],
+                ["Num classes", num_classes if num_classes is not None else "N/A"],
+                ["Split type", meta.get("split_type") or "N/A"],
+            ],
+        }
+    ]
+
+    graph = metrics.get("graph") or {}
+    scope = metrics.get("graph_scope") or {}
+    label_map = dict(gm.GRAPH_METRIC_LABELS)
+    g_rows = []
+    for key, _label in gm.GRAPH_METRIC_LABELS:
+        if key not in graph or graph.get(key) is None:
+            continue
+        label = label_map.get(key, key)
+        if key in scope:
+            label = f"{label} ({scope[key]})"
+        g_rows.append([label, gm.fmt_value(graph[key])])
+    sections.append({
+        "heading": "Displayed graph (after sampling)",
+        "columns": ["Metric", "Value"],
+        "rows": g_rows,
+    })
+
+    struct_rows = _compute_selected_structural_metrics() or []
+    if struct_rows:
+        sections.append({
+            "heading": "Selected neighborhoods (structural)",
+            "columns": ["Neighborhood", "Spectral radius",
+                        "Clustering (adjacency only)"],
+            "rows": [
+                [r.get("Neighborhood"), r.get("Spectral radius"),
+                 r.get("Clustering (adjacency only)")]
+                for r in struct_rows
+            ],
+        })
+
+    nodes = metrics.get("nodes") or {}
+    if nodes:
+        centrality = st.session_state.get("metrics_top_centrality") or "degree_centrality"
+        sample = next(iter(nodes.values()), {})
+        if sample.get(centrality) is None:
+            centrality = "degree_centrality"
+        summary = gm.summarize_metrics(metrics, centrality=centrality, top_k=5)
+        top_rows = [[nid, gm.fmt_value(val)] for nid, val in summary["top_nodes"]]
+        if top_rows:
+            sections.append({
+                "heading": f"Top nodes by {centrality}",
+                "columns": ["Node", "Value"],
+                "rows": top_rows,
+            })
+        neg = summary["forman_most_negative"]
+        if neg:
+            sections.append({
+                "heading": "Most negative Forman-Ricci edges",
+                "columns": ["Edge", "Forman"],
+                "rows": [[f"{u} — {v}", gm.fmt_value(val)] for (u, v), val in neg],
+            })
+
+    return stats_html.build_stats_html(sections, title=title, subtitle=subtitle)
+
 
 def _render_metrics_top_elements(metrics):
     """Top-k nodes by a chosen centrality plus Forman-Ricci extremes."""
@@ -5183,7 +5317,12 @@ def main():
     sidebar_cfg = None
     with st.sidebar:
         st.markdown(
-            '<div class="topo-sidebar-title">TopoExplorer</div>',
+            """
+            <div class="topo-sidebar-brand">
+              <div class="topo-sidebar-title">TopoExplorer</div>
+              <div class="topo-sidebar-tagline">built on TopoBench</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
         tab = _render_sidebar_tab_selector(data_loaded)
