@@ -9,11 +9,13 @@
 [![Built on TopoBench](https://img.shields.io/badge/Built%20on-TopoBench-6f42c1.svg)](https://github.com/geometric-intelligence/topobench)
 [![Live demo](https://img.shields.io/badge/Live%20demo-topoexplorer.pagekite.me-16a34a.svg)](https://topoexplorer.pagekite.me/)
 
+<img src="docs/img/hero.gif" alt="TopoExplorer rendering a strictly augmented Hasse graph" width="880">
+<!-- To go back to the static screenshot, comment the line above and uncomment the one below:
 <img src="docs/img/hero.png" alt="TopoExplorer rendering a strictly augmented Hasse graph" width="880">
+-->
+
 
 </div>
-
----
 
 ## What is TopoExplorer?
 
@@ -22,33 +24,31 @@ interactions. Most TDL pipelines begin with a **lifting procedure** that turns a
 into a higher-order domain (simplicial, cellular, hypergraph, or combinatorial complex)
 before a model is trained on it. But different liftings can induce drastically different
 connectivity on the *same* dataset, and today those choices are usually made from a menu
-with little structural inspection — a blind **lift-then-train** workflow.
+with little structural inspection, following a blind **lift-then-train** workflow.
 
-**TopoExplorer** turns that into a principled **lift → diagnose → design → train** workflow.
-It exposes the *strictly augmented Hasse graph* of any lifted complex — making its
-**neighborhoods** (incidence and adjacency, across cell ranks) explicit in graph form — and
+**TopoExplorer** turns that into a principled **lift, diagnose, design, train** workflow.
+It exposes the *strictly augmented Hasse graph* of any lifted complex, making its
+**neighborhoods** (incidence and adjacency, across cell ranks) explicit in graph form, and
 lets you both *see* and *measure* the structure a lifting creates before committing to
 training. Alongside the interactive visualization, it computes structural and feature-based
-graph metrics (spectral radius, clustering coefficient, Forman–Ricci curvature, degree
-statistics, connected components, heterophily, …) that can be compared across candidate
-liftings and neighborhood choices.
+graph metrics (spectral radius, clustering coefficient, Forman-Ricci curvature, degree
+statistics, connected components, heterophily, and more) that can be compared across
+candidate liftings and neighborhood choices.
 
 **At a glance:**
 
 - 🔎 **Inspect** liftings across the simplicial, cellular, hypergraph and combinatorial domains from the TopoBench catalogue.
-- 🧩 **Toggle neighborhoods** — graph/higher-order adjacency and incidence — and view each as an interactive Hasse graph, individually or combined.
+- 🧩 **Toggle neighborhoods** (graph and higher-order adjacency and incidence) and view each as an interactive Hasse graph, individually or combined.
 - 📊 **Quantify structure** with pre-training graph metrics to inform lifting and neighborhood design decisions.
 - 💾 **Export** any view as a self-contained, shareable HTML file with all computed metrics embedded.
 
-> Try it now — no install needed: **<https://topoexplorer.pagekite.me/>**
-
----
+> Try it now, no install needed: **<https://topoexplorer.pagekite.me/>**
 
 ## Installation
 
 ### Prerequisites
 
-- **Python 3.11** (TopoBench pins `>=3.11, <3.12`)
+- **Python 3.11**
 - `pip`
 
 ### Linux / macOS
@@ -71,10 +71,6 @@ streamlit run topoexplorer/neighborhood_explorer_app.py
 
 The app opens in your browser at <http://localhost:8501>.
 
-`requirements.txt` installs `torch` (CPU build), the PyG companion wheels, `streamlit`, and
-`topobench` (from its [GitHub repository](https://github.com/geometric-intelligence/topobench),
-as it is not published on PyPI).
-
 ### Windows
 
 Some TopoBench transitive dependencies do not build cleanly on Windows, so a helper script
@@ -86,50 +82,42 @@ installs a working subset:
 streamlit run topoexplorer\neighborhood_explorer_app.py
 ```
 
----
-
 ## Usage guide
 
 TopoExplorer follows a simple six-step workflow, all driven from the sidebar (see the
 overview screenshot above, using the bundled **MUTAG** dataset):
 
 1. **Select a dataset.** Choose a topological domain and dataset. The app shows descriptive
-   metadata (task, number of features, number of classes, …).
+   metadata such as task, number of features and number of classes.
 2. **Configure a lifting.** Pick a target domain (hypergraph, simplicial, cell, combinatorial)
    and a lifting method from the TopoBench catalogue, together with its hyperparameters.
 3. **Load and lift.** Click **Load graph** to load and cache the dataset via the TopoBench API;
    the lifting is applied to the selected sample, producing the higher-order complex.
-4. **Select neighborhoods.** Choose one or more neighborhood types — graph adjacency, graph
-   incidence, higher-order adjacency (across ranks), higher-order incidence (between ranks).
+4. **Select neighborhoods.** Choose one or more neighborhood types: graph adjacency, graph
+   incidence, higher-order adjacency (across ranks), and higher-order incidence (between ranks).
    Each is rendered as a Hasse graph you can inspect individually or combine to compare
    information flow across ranks.
 5. **Read the metrics.** Inspect the structural and feature-based metrics computed for the
-   current view (see below). They are meant to be read *comparatively* — across candidate
-   liftings, neighborhoods, and hyperparameters — not against universal thresholds.
+   current view. They are meant to be read *comparatively*, across candidate liftings,
+   neighborhoods, and hyperparameters, rather than against universal thresholds.
 6. **Adjust, render and export.** Navigate between samples (inductive datasets re-apply the
    lifting automatically) and adjust display filters (minimum cell degree, maximum cells per
    rank) without changing the underlying complex. Then explore the interactive view, open it
    in a standalone window, or export it as a self-contained HTML file with all metrics embedded.
 
-<p align="center"><img src="docs/img/metrics.png" alt="TopoExplorer quantitative metrics panel" width="400"></p>
-
----
-
 ## Repository structure
 
 | Path | Description |
-| --- | --- |
+| :-- | :-- |
 | `topoexplorer/` | Application source code (Streamlit app, graph metrics, D3 renderer). |
 | `topoexplorer/neighborhood_explorer_app.py` | Main Streamlit entry point. |
 | `topoexplorer/graph_metrics.py` | Structural and feature-based graph metric computations. |
 | `topoexplorer/d3_graph_html.py` | Standalone D3 HTML export of a graph view. |
 | `datasets/` | Bundled sample dataset (MUTAG, from TUDataset). |
-| `docs/img/` | Screenshots and GIFs used in this README. |
+| `docs/img/` | Images used in this README. |
 | `.streamlit/` | Streamlit server configuration. |
-| `requirements.txt` · `runtime.txt` | Dependency and Python-version pins. |
+| `requirements.txt`, `runtime.txt` | Dependency and Python-version pins. |
 | `setup-windows.ps1` | Windows installation helper. |
-
----
 
 ## The paper
 
@@ -143,10 +131,8 @@ performance, supporting a structure-aware design pipeline.
 - **Built on:** [TopoBench](https://github.com/geometric-intelligence/topobench)
 - **Related architectures:** TopoTune and HOPSE, which process neighborhoods as separate channels.
 
-> 📄 **Citation:** the paper is forthcoming — a citation and BibTeX entry will be added here
+> 📄 **Citation:** the paper is forthcoming; a citation and BibTeX entry will be added here
 > upon publication.
-
----
 
 ## License and community
 
