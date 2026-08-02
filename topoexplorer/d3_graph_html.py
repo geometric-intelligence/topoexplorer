@@ -654,6 +654,9 @@ def build_standalone_d3_html(
         .attr("width", width).attr("height", height)
         .attr("viewBox", [0, 0, width, height]);
 
+      // SVG <defs>: per-link color gradients (rank-to-rank edges) and one
+      // reusable arrowhead marker per distinct incidence color, referenced by
+      // links via marker-end.
       const defs = svg.append("defs");
       const gradientLinks = links.filter(function(l) { return !!l._gradId; });
       const gradients = defs.selectAll("linearGradient")
@@ -696,6 +699,10 @@ def build_standalone_d3_html(
         .on("zoom", function(ev) { g.attr("transform", ev.transform); });
       svg.call(zoom);
 
+      // Force-directed layout. Links pull adjacent cells to a ~48px rest
+      // distance; charge pushes all nodes apart (weaker for bipartite views to
+      // keep the two layers compact); collision scales the exclusion radius
+      // with node degree so busy hubs do not overlap.
       const simulation = d3.forceSimulation(nodes)
         .force("link", d3.forceLink(links).id(function(d) { return d.id; }).distance(48).strength(0.62))
         .force("charge", d3.forceManyBody().strength(function() {
