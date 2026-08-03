@@ -13,7 +13,6 @@ import copy
 import json
 import re
 import math
-import uuid
 from pathlib import Path
 import yaml
 
@@ -27,6 +26,8 @@ import torch
 
 from d3_graph_html import build_standalone_d3_html
 import graph_metrics as gm
+import branding
+import stats_html
 from omegaconf import OmegaConf
 from torch_geometric.utils import to_undirected
 import rootutils
@@ -44,6 +45,24 @@ _TOPOEXPLORER_ROOT = Path(__file__).parent.parent
 _orig_setup_root = rootutils.setup_root
 
 def _setup_root_with_fallback(search_from, indicator=".project-root", **kwargs):
+    """Resolve the project root, falling back to the TopoExplorer repo root.
+
+    Wraps ``rootutils.setup_root`` so that when topobench is installed as a pip
+    package (and the ``.project-root`` marker cannot be found from the install
+    location) the lookup degrades gracefully to this repository's root instead
+    of raising.
+
+    Args:
+        search_from: Path from which ``rootutils`` starts searching upwards for
+            the marker file.
+        indicator: Name of the marker file identifying the project root.
+        **kwargs: Extra keyword arguments forwarded to ``rootutils.setup_root``
+            (e.g. ``pythonpath``).
+
+    Returns:
+        pathlib.Path: The resolved project root, or the TopoExplorer repo root
+        when the marker cannot be located.
+    """
     try:
         return _orig_setup_root(search_from, indicator, **kwargs)
     except FileNotFoundError:
@@ -221,11 +240,25 @@ st.markdown(
         z-index: 10;
         background: transparent;
     }}
+    .topo-sidebar-brand {{
+        text-align: center;
+        margin: 0.5rem 2.25rem 0.75rem 2.25rem;
+    }}
     .topo-sidebar-title {{
         text-align: center;
-        margin: 0.5rem 2.25rem 0.5rem 2.25rem;
-        font-size: 1.35rem;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 1.4rem;
         font-weight: 700;
+        color: {branding.BRAND["ink"]};
+        line-height: 1.1;
+    }}
+    .topo-sidebar-tagline {{
+        text-align: center;
+        font-size: 0.72rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-top: 0.15rem;
+        color: {branding.BRAND["muted"]};
     }}
     [data-testid="stSidebarHeader"] {{
         min-height: 0;
@@ -406,6 +439,9 @@ def _sample_colormap_hex(cmap_name, n, *, start=0.12, end=0.88, spread="golden")
         return [mcolors.to_hex(cmap(mid))]
     span = end - start
     if spread == "golden" and n > 2:
+        # Golden-ratio conjugate (1/phi). Stepping the colormap by this
+        # irrational fraction spreads successive colors far apart, avoiding the
+        # adjacent near-duplicates that uniform sampling produces.
         phi = 0.618033988749895
         ts = sorted(start + ((i * phi) % 1.0) * span for i in range(n))
     else:
@@ -676,12 +712,14 @@ def _build_relations_legend(
     out = []
 
     def _solid_for_nb(nb_id, fallback):
+        """Return the per-neighborhood solid color, or ``fallback`` if unset."""
         if nb_id and nb_id in solid_color_map:
             return solid_color_map[nb_id]
         return fallback
 
     def _emit_incidence(src_rank, tgt_rank, direction, *,
                         color, color_start, color_end, target_kind):
+        """Append a deduplicated incidence entry to the relations legend."""
         key = ("incidence", src_rank, tgt_rank, direction, target_kind)
         if key in seen:
             return
@@ -991,6 +1029,15 @@ def incidence_to_sparse_incidence(data):
 
 
 def _sparse_coo_nnz(sp) -> int:
+    """Count the stored (non-zero) entries of a sparse COO tensor.
+
+    Args:
+        sp: A ``torch.sparse_coo_tensor``, or ``None``.
+
+    Returns:
+        int: Number of stored values after coalescing, or ``0`` if ``sp`` is
+        ``None``.
+    """
     if sp is None:
         return 0
     sp = sp.coalesce()
@@ -1065,6 +1112,16 @@ def incidence_rank_one_to_sparse(data):
 
 
 def _incidence_ranks_present(data):
+    """List the ranks ``k`` for which an ``incidence_k`` matrix exists.
+
+    Args:
+        data: A topobench data object whose keys may include ``incidence_k``
+            entries.
+
+    Returns:
+        list[int]: The ranks ``k`` present, sorted in descending order (highest
+        rank first).
+    """
     ranks = []
     for key in _data_keys(data):
         m = re.match(r"^incidence_(\d+)$", key)
@@ -1461,6 +1518,7 @@ def pick_default_neighborhood_id(available):
         return None
 
     def _key(n):
+        """Sort key preferring low source rank, low r, and up-incidence."""
         try:
             r, direction, ntype, src = parse_neighborhood(n["id"])
         except Exception:
@@ -1480,6 +1538,7 @@ def _discover_rank_populations(data):
     populations = {}
 
     def _set_rank(rank, count):
+        """Record ``count`` as the population of ``rank`` (keeping the max)."""
         try:
             rank_i = int(rank)
             count_i = int(count)
@@ -1534,12 +1593,14 @@ def compute_shared_node_sampling(data, *, caps_by_rank, cap_hyperedges=None):
     hyper_degree = {}
 
     def _add_rank_degree(rank, node_id, delta=1):
+        """Accumulate ``delta`` into the degree of ``node_id`` at ``rank``."""
         rank = int(rank)
         node_id = int(node_id)
         mp = degree_by_rank.setdefault(rank, {})
         mp[node_id] = mp.get(node_id, 0) + int(delta)
 
     def _count_adjacency(sp, rank):
+        """Add each undirected adjacency edge once to both endpoints' degrees."""
         sp = sp.coalesce()
         idx = sp.indices().numpy()
         seen_pairs = set()
@@ -2062,6 +2123,18 @@ def networkx_to_d3_payload(
 # ============================================================================
 
 def _layered_node_id(rank: int, original_id) -> str:
+    """Build a stable, rank-qualified node id for the layered (multi-rank) view.
+
+    Prefixing the original id with its rank keeps ids unique across layers, so
+    the same cell index appearing at different ranks does not collide.
+
+    Args:
+        rank: The cell rank (layer) the node belongs to.
+        original_id: The node's index within its rank.
+
+    Returns:
+        str: An id of the form ``"r{rank}_n{original_id}"``.
+    """
     return f"r{int(rank)}_n{int(original_id)}"
 
 
@@ -2815,6 +2888,7 @@ def validate_basic_lifting_config(config):
     errors = []
 
     def _is_pos_int(v):
+        """Return True if ``v`` is a positive integer (rejecting bools)."""
         return isinstance(v, int) and not isinstance(v, bool) and v >= 1
 
     if "complex_dim" in config and not _is_pos_int(config["complex_dim"]):
@@ -4176,21 +4250,49 @@ def _reload_graph_at_index(graph_index):
     return ok
 
 
+# Default per-rank node cap. Populations at or below this are shown in full;
+# larger ranks are sub-sampled to this many nodes to keep the D3 layout
+# responsive in the browser.
 DEFAULT_LARGE_CAP = 150
 
 
 def _default_cap_for_population(pop):
+    """Cap a rank population to ``DEFAULT_LARGE_CAP``, leaving small ranks whole.
+
+    Args:
+        pop: Number of cells present at a given rank.
+
+    Returns:
+        int: ``pop`` if it does not exceed ``DEFAULT_LARGE_CAP``, otherwise the
+        cap.
+    """
     pop = int(pop)
     return pop if pop <= DEFAULT_LARGE_CAP else DEFAULT_LARGE_CAP
 
 
 def _auto_caps_by_rank(rank_populations):
+    """Derive a default per-rank sampling cap from measured rank populations.
+
+    Args:
+        rank_populations: Mapping of ``rank -> population`` (cell count).
+
+    Returns:
+        dict[int, int]: Mapping of ``rank -> cap`` obtained by applying
+        :func:`_default_cap_for_population` to each population.
+    """
     return {
         int(r): _default_cap_for_population(p) for r, p in rank_populations.items()
     }
 
 
 def _default_load_sampling_cfg():
+    """Return the default sampling configuration used when loading a dataset.
+
+    Returns:
+        dict: Sampling config with empty per-rank caps, no hyperedge cap, a
+        global ``max_nodes`` of ``DEFAULT_LARGE_CAP`` and no minimum-degree
+        filter.
+    """
     return {
         "caps_by_rank": {},
         "hyperedge_cap": None,
@@ -4957,6 +5059,124 @@ def _render_metrics_tab():
         if not flags.get("expensive"):
             st.caption("Enable to add per-node/edge centralities to tooltips and tables.")
 
+    stats_doc = _build_stats_html(metrics)
+    if stats_doc:
+        st.download_button(
+            label="Download stats (HTML)",
+            data=stats_doc,
+            file_name="topobench_metrics.html",
+            mime="text/html",
+            key="stats_download_main",
+            width="stretch",
+        )
+
+
+def _build_stats_html(metrics):
+    """Assemble the standalone stats HTML for the current view.
+
+    Reuses the already-computed metric tables (whole-graph summary, selected
+    neighborhood structural metrics, top nodes and Forman-Ricci extremes) plus
+    the dataset metadata, and renders them as a branded, self-contained page via
+    :func:`stats_html.build_stats_html`.
+
+    Args:
+        metrics: The metrics dict from ``st.session_state["_graph_metrics"]``.
+
+    Returns:
+        str | None: The HTML document, or ``None`` if no metrics are available.
+    """
+    if not metrics:
+        return None
+
+    domain = st.session_state.get("cfg_domain")
+    dataset_name = st.session_state.get("dataset_name")
+    meta = (
+        extract_dataset_metadata(domain, dataset_name)
+        if domain and dataset_name
+        else {}
+    )
+    num_nodes = _node_count_from_dataset(st.session_state.get("data"))
+    num_graphs = int(st.session_state.get("loaded_dataset_size", 1) or 1)
+
+    payload = st.session_state.get("_d3_payload") or {}
+    title = payload.get("title") or (dataset_name or "TopoExplorer")
+    subtitle = payload.get("subtitle") or ""
+
+    num_classes = meta.get("num_classes")
+    sections = [
+        {
+            "heading": "Dataset",
+            "columns": ["Field", "Value"],
+            "rows": [
+                ["Domain", domain or "N/A"],
+                ["Dataset", dataset_name or "N/A"],
+                ["Nodes (displayed graph)",
+                 num_nodes if num_nodes is not None else "N/A"],
+                ["Number of graphs", num_graphs],
+                ["Task", meta.get("task") or "N/A"],
+                ["Task level", meta.get("task_level") or "N/A"],
+                ["Learning setting", meta.get("learning_setting") or "N/A"],
+                ["Num features", _format_num_features(meta.get("num_features"))],
+                ["Num classes", num_classes if num_classes is not None else "N/A"],
+                ["Split type", meta.get("split_type") or "N/A"],
+            ],
+        }
+    ]
+
+    graph = metrics.get("graph") or {}
+    scope = metrics.get("graph_scope") or {}
+    label_map = dict(gm.GRAPH_METRIC_LABELS)
+    g_rows = []
+    for key, _label in gm.GRAPH_METRIC_LABELS:
+        if key not in graph or graph.get(key) is None:
+            continue
+        label = label_map.get(key, key)
+        if key in scope:
+            label = f"{label} ({scope[key]})"
+        g_rows.append([label, gm.fmt_value(graph[key])])
+    sections.append({
+        "heading": "Displayed graph (after sampling)",
+        "columns": ["Metric", "Value"],
+        "rows": g_rows,
+    })
+
+    struct_rows = _compute_selected_structural_metrics() or []
+    if struct_rows:
+        sections.append({
+            "heading": "Selected neighborhoods (structural)",
+            "columns": ["Neighborhood", "Spectral radius",
+                        "Clustering (adjacency only)"],
+            "rows": [
+                [r.get("Neighborhood"), r.get("Spectral radius"),
+                 r.get("Clustering (adjacency only)")]
+                for r in struct_rows
+            ],
+        })
+
+    nodes = metrics.get("nodes") or {}
+    if nodes:
+        centrality = st.session_state.get("metrics_top_centrality") or "degree_centrality"
+        sample = next(iter(nodes.values()), {})
+        if sample.get(centrality) is None:
+            centrality = "degree_centrality"
+        summary = gm.summarize_metrics(metrics, centrality=centrality, top_k=5)
+        top_rows = [[nid, gm.fmt_value(val)] for nid, val in summary["top_nodes"]]
+        if top_rows:
+            sections.append({
+                "heading": f"Top nodes by {centrality}",
+                "columns": ["Node", "Value"],
+                "rows": top_rows,
+            })
+        neg = summary["forman_most_negative"]
+        if neg:
+            sections.append({
+                "heading": "Most negative Forman-Ricci edges",
+                "columns": ["Edge", "Forman"],
+                "rows": [[f"{u} — {v}", gm.fmt_value(val)] for (u, v), val in neg],
+            })
+
+    return stats_html.build_stats_html(sections, title=title, subtitle=subtitle)
+
 
 def _render_metrics_top_elements(metrics):
     """Top-k nodes by a chosen centrality plus Forman-Ricci extremes."""
@@ -5060,6 +5280,17 @@ def _persist_widget_state():
 
 
 def main():
+    """Render the full Streamlit app: sidebar controls and the graph view.
+
+    This is the entry point invoked on every Streamlit rerun. It restores
+    persisted widget state, seeds first-load defaults (domain ``graph`` /
+    dataset ``MUTAG``, lifting enabled), builds the sidebar configuration
+    (dataset, lifting, neighborhoods, sampling and visualization options) and
+    renders the resulting Hasse-graph view together with the metrics panel.
+
+    Side effects:
+        Reads and writes ``st.session_state`` and emits Streamlit UI elements.
+    """
     _persist_widget_state()
 
     flash = st.session_state.pop("_flash_ok", None)
@@ -5086,7 +5317,12 @@ def main():
     sidebar_cfg = None
     with st.sidebar:
         st.markdown(
-            '<div class="topo-sidebar-title">TopoExplorer</div>',
+            """
+            <div class="topo-sidebar-brand">
+              <div class="topo-sidebar-title">TopoExplorer</div>
+              <div class="topo-sidebar-tagline">built on TopoBench</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
         tab = _render_sidebar_tab_selector(data_loaded)
@@ -5102,6 +5338,7 @@ def main():
         load_cfg = {**sidebar_cfg, **_default_load_sampling_cfg()}
         with st.status("Loading graph…", expanded=True) as status:
             def _progress(msg):
+                """Relay a load-progress message to the Streamlit status box."""
                 status.update(label=f"Loading graph… {msg}", state="running")
                 status.write(msg)
 

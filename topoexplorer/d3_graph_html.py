@@ -6,6 +6,8 @@ import html as html_module
 import json
 from typing import Any
 
+import branding
+
 
 def build_standalone_d3_html(
     payload: dict[str, Any],
@@ -45,6 +47,18 @@ def build_standalone_d3_html(
     embedded_json = json_text.replace("</", "\\u003c/")
     title_esc = html_module.escape(payload.get("title") or "Graph")
 
+    # Brand palette. The credit footer is only rendered in the standalone
+    # (downloadable) file, so the in-app iframe stays uncluttered.
+    _brand = branding.BRAND
+    footer_block = (
+        ""
+        if embed
+        else (
+            '  <footer class="tb-credit">Generated with TopoExplorer '
+            "&middot; built on <span>TopoBench</span></footer>\n"
+        )
+    )
+
     if embed:
         chart_size_css = (
             f"width: 100%; min-height: {int(chart_min_height)}px; "
@@ -52,7 +66,8 @@ def build_standalone_d3_html(
         )
         body_extra = "html, body { height: 100%; }"
     else:
-        chart_size_css = "width: 100vw; min-height: 480px; height: calc(100vh - 88px);"
+        # Reserve room for the branded header (~64px) and the credit footer (~30px).
+        chart_size_css = "width: 100vw; min-height: 480px; height: calc(100vh - 118px);"
         body_extra = ""
 
     cache_comment = ""
@@ -102,14 +117,32 @@ def build_standalone_d3_html(
     * {{ box-sizing: border-box; }}
     {body_extra}
     body {{ font-family: system-ui, Segoe UI, sans-serif; margin: 0; background: #f0f0f0; }}
-    header {{ padding: 12px 16px; background: #fff; border-bottom: 1px solid #ccc; }}
-    header h1 {{ margin: 0; font-size: 1.1rem; }}
-    header p {{ margin: 4px 0 0; color: #555; font-size: 0.85rem; }}
+    header {{ display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+      background: #fff; border-bottom: 3px solid {_brand["primary"]}; }}
+    header .hdr-text {{ flex: 1 1 auto; min-width: 0; }}
+    header h1 {{ margin: 0; font-size: 1.1rem; color: {_brand["ink"]};
+      font-family: Georgia, "Times New Roman", serif; }}
+    header p {{ margin: 3px 0 0; color: {_brand["muted"]}; font-size: 0.85rem; }}
     header p:empty {{ display: none; margin: 0; }}
+    header .built-on {{ flex: 0 0 auto; color: {_brand["muted"]}; font-size: 0.75rem;
+      text-align: right; }}
+    header .built-on span {{ color: {_brand["primary"]}; font-weight: 600; }}
+    footer.tb-credit {{ padding: 7px 18px; text-align: right; color: {_brand["muted"]};
+      font-size: 0.72rem; border-top: 1px solid {_brand["border"]};
+      background: {_brand["bg_soft"]}; }}
+    footer.tb-credit span {{ color: {_brand["primary"]}; font-weight: 600; }}
     #chart-wrap {{ position: relative; {chart_size_css} }}
     #chart {{ width: 100%; height: 100%; min-height: inherit; }}
     #err {{ color: #b00; padding: 16px; white-space: pre-wrap; font-family: monospace; }}
-    svg {{ display: block; background: #fafafa; width: 100%; height: 100%; }}
+    svg {{ display: block; background: #fff; width: 100%; height: 100%; }}
+    #export-toolbar {{ display: none; position: absolute; bottom: 12px; left: 12px;
+      z-index: 6; gap: 6px; }}
+    #export-toolbar button {{ font: 600 12px system-ui, Segoe UI, sans-serif;
+      color: {_brand["ink"]}; background: #fff; border: 1px solid {_brand["border"]};
+      border-radius: 6px; padding: 5px 11px; cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12); }}
+    #export-toolbar button:hover {{ border-color: {_brand["primary"]};
+      color: {_brand["primary"]}; }}
     .node circle {{ stroke-width: 2px; cursor: grab; }}
     .node text {{ font-size: 9px; pointer-events: none; fill: #111; }}
     line.link {{ stroke-opacity: 0.85; }}
@@ -120,8 +153,8 @@ def build_standalone_d3_html(
       box-shadow: 0 1px 4px rgba(0,0,0,0.08); pointer-events: none;
       max-width: min(280px, 65%);
     }}
-    #legend .legend-title {{ display: block; font-weight: 600; font-size: 11px;
-      color: #555; letter-spacing: 0.02em; text-transform: uppercase;
+    #legend .legend-title {{ display: block; font-weight: 700; font-size: 11px;
+      color: {_brand["primary"]}; letter-spacing: 0.02em; text-transform: uppercase;
       margin-bottom: 6px; }}
     #legend .legend-section + .legend-section {{
       margin-top: 8px; padding-top: 8px;
@@ -142,8 +175,8 @@ def build_standalone_d3_html(
       box-shadow: 0 1px 4px rgba(0,0,0,0.08); pointer-events: none;
       max-width: min(240px, 60%);
     }}
-    #metrics-hud .hud-title {{ display: block; font-weight: 600; font-size: 11px;
-      color: #555; letter-spacing: 0.02em; text-transform: uppercase;
+    #metrics-hud .hud-title {{ display: block; font-weight: 700; font-size: 11px;
+      color: {_brand["primary"]}; letter-spacing: 0.02em; text-transform: uppercase;
       margin-bottom: 6px; }}
     #metrics-hud .hud-row {{ display: flex; justify-content: space-between;
       gap: 12px; margin: 2px 0; }}
@@ -153,15 +186,20 @@ def build_standalone_d3_html(
 </head>
 <body>
   <header>
-    <h1 id="hdr-title"></h1>
-    <p id="hdr-sub"></p>
+    <div class="hdr-text">
+      <h1 id="hdr-title"></h1>
+      <p id="hdr-sub"></p>
+    </div>
+    <div class="built-on">built on <span>TopoBench</span></div>
   </header>
   <div id="err"></div>
   <div id="chart-wrap">
     <div id="metrics-hud" aria-label="Displayed graph metrics"></div>
     <div id="legend" aria-label="Rank legend"></div>
+    <div id="export-toolbar" aria-label="Export figure"></div>
     <div id="chart"></div>
   </div>
+{footer_block}
   <script type="application/json" id="graph-payload">"""
 
     # Plain string (not f-string): JavaScript uses single `{` / `}`.
@@ -465,10 +503,14 @@ def build_standalone_d3_html(
         // mirroring the 2D SVG ``<linearGradient>`` look. Otherwise we fall
         // back to a flat per-link color so the view still renders.
         const hasTHREE = (typeof THREE !== "undefined");
-        const graph3d = ForceGraph3D()(chart)
+        // ``preserveDrawingBuffer`` keeps the last rendered frame readable so
+        // the WebGL canvas can be captured to PNG on demand (figure export).
+        const graph3d = ForceGraph3D({
+            rendererConfig: { preserveDrawingBuffer: true, antialias: true }
+          })(chart)
           .width(width)
           .height(height)
-          .backgroundColor("#fafafa")
+          .backgroundColor("#ffffff")
           .nodeRelSize(4)
           .nodeColor(function(n) { return n.color || "#666"; })
           .nodeLabel(function(n) { return nodeTooltip(n); })
@@ -606,6 +648,128 @@ def build_standalone_d3_html(
           });
           ro.observe(chart);
         })();
+
+        // --- Figure export (PNG) for the 3D (WebGL) view --------------------
+        // SVG cannot represent a WebGL 3D scene, so 3D exports a PNG: we grab
+        // the renderer canvas (kept readable via preserveDrawingBuffer) and
+        // composite the title and legend on top, so the figure is
+        // self-describing and ready for slides and papers. WYSIWYG: it
+        // captures the current camera view (rotate/zoom to frame it first).
+        (function setup3dExport() {
+          var toolbar = document.getElementById("export-toolbar");
+          if (!toolbar) return;
+
+          function slugify(s) {
+            return (String(s || "topobench_graph").toLowerCase()
+              .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")) || "topobench_graph";
+          }
+          function roundRect(ctx, x, y, w, h, r) {
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.arcTo(x + w, y, x + w, y + h, r);
+            ctx.arcTo(x + w, y + h, x, y + h, r);
+            ctx.arcTo(x, y + h, x, y, r);
+            ctx.arcTo(x, y, x + w, y, r);
+            ctx.closePath();
+          }
+          function drawTitle(ctx) {
+            var title = payload.title || "", sub = payload.subtitle || "";
+            ctx.textBaseline = "alphabetic";
+            if (title) {
+              ctx.font = "700 15px system-ui, Segoe UI, sans-serif";
+              ctx.fillStyle = "#2c2a3a"; ctx.fillText(title, 16, 26);
+            }
+            if (sub) {
+              ctx.font = "12px system-ui, Segoe UI, sans-serif";
+              ctx.fillStyle = "#8a8f98"; ctx.fillText(sub, 16, title ? 44 : 26);
+            }
+          }
+          function drawLegend(ctx) {
+            var ranks = (payload.legend || []).filter(function(e){ return e && e.color; });
+            var rels = (payload.relationsLegend || []).filter(function(e){ return !!e; });
+            if (!ranks.length && !rels.length) return;
+            var rowH = 18, padX = 10, titleH = 16;
+            var labels = ranks.map(function(e){ return e.label || ("Rank " + e.rank); })
+              .concat(rels.map(function(r){ return r.label || ""; }));
+            var maxLen = labels.reduce(function(m, s){
+              return Math.max(m, String(s).length); }, 4);
+            var boxW = Math.min(280, Math.max(150, maxLen * 6.6 + 46));
+            var lines = (ranks.length ? 1 + ranks.length : 0)
+              + (rels.length ? 1 + rels.length : 0);
+            var boxH = 16 + lines * rowH + (ranks.length && rels.length ? 6 : 0);
+            ctx.save();
+            ctx.translate(width - boxW - 12, 12);
+            ctx.fillStyle = "rgba(255,255,255,0.96)";
+            ctx.strokeStyle = "#d0d0d0"; ctx.lineWidth = 1;
+            roundRect(ctx, 0, 0, boxW, boxH, 6); ctx.fill(); ctx.stroke();
+            var y = 20;
+            if (ranks.length) {
+              ctx.font = "700 10px system-ui, sans-serif";
+              ctx.fillStyle = "#c13ba8"; ctx.fillText("RANKS", padX, y);
+              y += titleH;
+              ranks.forEach(function(e){
+                ctx.beginPath(); ctx.arc(padX + 6, y - 4, 6, 0, 2 * Math.PI);
+                ctx.fillStyle = e.color; ctx.fill();
+                ctx.strokeStyle = "rgba(0,0,0,0.18)"; ctx.stroke();
+                ctx.font = "12px system-ui, sans-serif"; ctx.fillStyle = "#2c2a3a";
+                ctx.fillText(e.label || ("Rank " + e.rank), padX + 18, y);
+                y += rowH;
+              });
+              if (rels.length) y += 6;
+            }
+            if (rels.length) {
+              ctx.font = "700 10px system-ui, sans-serif";
+              ctx.fillStyle = "#c13ba8"; ctx.fillText("NEIGHBORHOODS", padX, y);
+              y += titleH;
+              rels.forEach(function(r){
+                var cy = y - 4, x1 = padX + 2, x2 = padX + 26;
+                var col = r.colorEnd || r.color || r.tgtColor || "#888";
+                ctx.strokeStyle = col; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(x1, cy); ctx.lineTo(x2, cy); ctx.stroke();
+                if (r.kind === "incidence") {
+                  ctx.fillStyle = col; ctx.beginPath();
+                  ctx.moveTo(x2, cy); ctx.lineTo(x2 - 6, cy - 3.5);
+                  ctx.lineTo(x2 - 6, cy + 3.5); ctx.closePath(); ctx.fill();
+                }
+                ctx.fillStyle = r.srcColor || col;
+                ctx.beginPath(); ctx.arc(x1, cy, 3.5, 0, 2 * Math.PI); ctx.fill();
+                ctx.fillStyle = r.tgtColor || col;
+                ctx.beginPath(); ctx.arc(x2, cy, 3.5, 0, 2 * Math.PI); ctx.fill();
+                ctx.fillStyle = "#2c2a3a"; ctx.font = "12px system-ui, sans-serif";
+                ctx.fillText(r.label || "", padX + 34, y);
+                y += rowH;
+              });
+            }
+            ctx.restore();
+          }
+          function exportPNG() {
+            var gl = graph3d.renderer && graph3d.renderer()
+              && graph3d.renderer().domElement;
+            if (!gl) { alert("3D renderer not ready yet; try again in a moment."); return; }
+            var out = document.createElement("canvas");
+            out.width = gl.width; out.height = gl.height;
+            var ctx = out.getContext("2d");
+            ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, out.width, out.height);
+            ctx.drawImage(gl, 0, 0, out.width, out.height);
+            ctx.save();
+            ctx.setTransform(out.width / width, 0, 0, out.height / height, 0, 0);
+            drawTitle(ctx); drawLegend(ctx);
+            ctx.restore();
+            out.toBlob(function(blob){
+              if (!blob) { alert("PNG export failed."); return; }
+              var url = URL.createObjectURL(blob);
+              var a = document.createElement("a");
+              a.href = url; a.download = slugify(payload.title) + ".png";
+              document.body.appendChild(a); a.click(); document.body.removeChild(a);
+              setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+            }, "image/png");
+          }
+          var b = document.createElement("button");
+          b.textContent = "⬇ PNG"; b.title = "Download high-res PNG (slides)";
+          b.onclick = exportPNG;
+          toolbar.appendChild(b);
+          toolbar.style.display = "flex";
+        })();
         return;
       }
 
@@ -654,6 +818,15 @@ def build_standalone_d3_html(
         .attr("width", width).attr("height", height)
         .attr("viewBox", [0, 0, width, height]);
 
+      // Solid white backdrop as a real SVG element (not just CSS) so a clean
+      // white background is part of any exported SVG/PNG figure.
+      svg.append("rect").attr("class", "export-bg")
+        .attr("x", 0).attr("y", 0).attr("width", width).attr("height", height)
+        .attr("fill", "#ffffff");
+
+      // SVG <defs>: per-link color gradients (rank-to-rank edges) and one
+      // reusable arrowhead marker per distinct incidence color, referenced by
+      // links via marker-end.
       const defs = svg.append("defs");
       const gradientLinks = links.filter(function(l) { return !!l._gradId; });
       const gradients = defs.selectAll("linearGradient")
@@ -696,6 +869,10 @@ def build_standalone_d3_html(
         .on("zoom", function(ev) { g.attr("transform", ev.transform); });
       svg.call(zoom);
 
+      // Force-directed layout. Links pull adjacent cells to a ~48px rest
+      // distance; charge pushes all nodes apart (weaker for bipartite views to
+      // keep the two layers compact); collision scales the exclusion radius
+      // with node degree so busy hubs do not overlap.
       const simulation = d3.forceSimulation(nodes)
         .force("link", d3.forceLink(links).id(function(d) { return d.id; }).distance(48).strength(0.62))
         .force("charge", d3.forceManyBody().strength(function() {
@@ -854,6 +1031,159 @@ def build_standalone_d3_html(
           return "translate(" + d.x + "," + d.y + ")";
         });
       });
+
+      // --- Figure export (SVG / PNG) --------------------------------------
+      // The force layout only exists in the browser, so export runs here. We
+      // serialize the live <svg> (white background + graph in the current
+      // view) and bake the title and legend into the SVG so the downloaded
+      // figure is self-describing and ready for slides and papers.
+      (function setupExport() {
+        var toolbar = document.getElementById("export-toolbar");
+        if (!toolbar) return;
+        var SVGNS = "http://www.w3.org/2000/svg";
+
+        function slugify(s) {
+          return (String(s || "topobench_graph").toLowerCase()
+            .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")) || "topobench_graph";
+        }
+        function el(name, attrs) {
+          var e = document.createElementNS(SVGNS, name);
+          for (var k in attrs) { if (attrs[k] != null) e.setAttribute(k, attrs[k]); }
+          return e;
+        }
+        function textEl(x, y, s, opts) {
+          opts = opts || {};
+          var t = el("text", {x: x, y: y,
+            "font-family": "system-ui, Segoe UI, sans-serif",
+            "font-size": opts.size || 13, "font-weight": opts.weight || 400,
+            fill: opts.fill || "#2c2a3a"});
+          t.textContent = (s == null ? "" : String(s));
+          return t;
+        }
+
+        function buildTitle(root) {
+          var title = payload.title || "", sub = payload.subtitle || "";
+          if (title) root.appendChild(textEl(16, 26, title, {size: 15, weight: 700}));
+          if (sub) root.appendChild(
+            textEl(16, title ? 44 : 26, sub, {size: 12, fill: "#8a8f98"}));
+        }
+
+        function buildLegend(root) {
+          var ranks = (payload.legend || []).filter(function(e){ return e && e.color; });
+          var rels = (payload.relationsLegend || []).filter(function(e){ return !!e; });
+          if (!ranks.length && !rels.length) return;
+          var rowH = 18, padX = 10, titleH = 16;
+          var labels = ranks.map(function(e){ return e.label || ("Rank " + e.rank); })
+            .concat(rels.map(function(r){ return r.label || ""; }));
+          var maxLen = labels.reduce(function(m, s){
+            return Math.max(m, String(s).length); }, 4);
+          var boxW = Math.min(280, Math.max(150, maxLen * 6.6 + 46));
+          var lines = (ranks.length ? 1 + ranks.length : 0)
+            + (rels.length ? 1 + rels.length : 0);
+          var boxH = 16 + lines * rowH + (ranks.length && rels.length ? 6 : 0);
+          var grp = el("g", {transform: "translate(" + (width - boxW - 12) + ",12)"});
+          grp.appendChild(el("rect", {x: 0, y: 0, width: boxW, height: boxH, rx: 6,
+            fill: "rgba(255,255,255,0.96)", stroke: "#d0d0d0"}));
+          var y = 20;
+          if (ranks.length) {
+            grp.appendChild(textEl(padX, y, "RANKS",
+              {size: 10, weight: 700, fill: "#c13ba8"}));
+            y += titleH;
+            ranks.forEach(function(e){
+              grp.appendChild(el("circle", {cx: padX + 6, cy: y - 4, r: 6,
+                fill: e.color, stroke: "rgba(0,0,0,0.18)"}));
+              grp.appendChild(textEl(padX + 18, y, e.label || ("Rank " + e.rank),
+                {size: 12}));
+              y += rowH;
+            });
+            if (rels.length) y += 6;
+          }
+          if (rels.length) {
+            grp.appendChild(textEl(padX, y, "NEIGHBORHOODS",
+              {size: 10, weight: 700, fill: "#c13ba8"}));
+            y += titleH;
+            rels.forEach(function(r){
+              var cy = y - 4, x1 = padX + 2, x2 = padX + 26;
+              var col = r.colorEnd || r.color || r.tgtColor || "#888";
+              grp.appendChild(el("line", {x1: x1, y1: cy, x2: x2, y2: cy,
+                stroke: col, "stroke-width": 2}));
+              if (r.kind === "incidence") {
+                grp.appendChild(el("polygon", {points:
+                  x2 + "," + cy + " " + (x2 - 6) + "," + (cy - 3.5)
+                  + " " + (x2 - 6) + "," + (cy + 3.5), fill: col}));
+              }
+              grp.appendChild(el("circle",
+                {cx: x1, cy: cy, r: 3.5, fill: r.srcColor || col, stroke: "#fff"}));
+              grp.appendChild(el("circle",
+                {cx: x2, cy: cy, r: 3.5, fill: r.tgtColor || col, stroke: "#fff"}));
+              grp.appendChild(textEl(padX + 34, y, r.label || "", {size: 12}));
+              y += rowH;
+            });
+          }
+          root.appendChild(grp);
+        }
+
+        function buildExportSvgString() {
+          var clone = svg.node().cloneNode(true);
+          clone.setAttribute("xmlns", SVGNS);
+          clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+          clone.setAttribute("width", width);
+          clone.setAttribute("height", height);
+          // Inline the CSS-only styles (they live in a <style> block, not as
+          // attributes) so the standalone SVG renders identically.
+          var style = document.createElementNS(SVGNS, "style");
+          style.textContent = ".node circle{stroke-width:2px}"
+            + ".node text{font-size:9px;fill:#111;font-family:system-ui,sans-serif}"
+            + "line.link{stroke-opacity:0.85}";
+          clone.insertBefore(style, clone.firstChild);
+          buildTitle(clone);
+          buildLegend(clone);
+          return new XMLSerializer().serializeToString(clone);
+        }
+
+        function download(blob, filename) {
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url; a.download = filename;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+        }
+
+        function exportSVG() {
+          download(new Blob([buildExportSvgString()],
+            {type: "image/svg+xml;charset=utf-8"}), slugify(payload.title) + ".svg");
+        }
+
+        function exportPNG(scale) {
+          var data = "data:image/svg+xml;base64,"
+            + btoa(unescape(encodeURIComponent(buildExportSvgString())));
+          var img = new Image();
+          img.onload = function() {
+            var canvas = document.createElement("canvas");
+            canvas.width = Math.round(width * scale);
+            canvas.height = Math.round(height * scale);
+            var ctx = canvas.getContext("2d");
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob(function(blob){
+              if (blob) download(blob, slugify(payload.title) + ".png");
+            }, "image/png");
+          };
+          img.onerror = function(){ alert("PNG export failed to rasterize the figure."); };
+          img.src = data;
+        }
+
+        function mkBtn(label, title, fn) {
+          var b = document.createElement("button");
+          b.textContent = label; b.title = title; b.onclick = fn;
+          return b;
+        }
+        toolbar.appendChild(mkBtn("⬇ SVG", "Download vector SVG (papers)", exportSVG));
+        toolbar.appendChild(
+          mkBtn("⬇ PNG", "Download high-res PNG (slides)", function(){ exportPNG(2); }));
+        toolbar.style.display = "flex";
+      })();
     } catch (e) {
       showError((e && e.stack) ? e.stack : String(e));
     }

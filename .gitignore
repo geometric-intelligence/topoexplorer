@@ -195,4 +195,8 @@ wandb/
 
 # test temporary
 .test_tmp/
-uv.lock".venv/" 
+uv.lock
+.venv/
+
+# Paper manuscript kept local only (not published in the public repo)
+/PAPER/

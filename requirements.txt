@@ -18,7 +18,7 @@ topobench @ git+https://github.com/geometric-intelligence/topobench.git
 
 # Streamlit + helpers used directly by the app.
 streamlit>=1.36,<2
-networkx>=3,<4
+networkx<3.0,>=2.6.0
 omegaconf>=2.3,<3
 rootutils>=1.0,<2
 PyYAML>=6
